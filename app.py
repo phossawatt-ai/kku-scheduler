@@ -80,7 +80,7 @@ class UniversityScheduler:
         model = cp_model.CpModel()
         shifts = {} 
         
-        # 1. Prepare Courses & Fixed Assignments
+        # 1. Prepare
         courses_to_solve = []
         for c in self.courses:
             if c.is_fixed and c.fixed_day and c.fixed_time:
@@ -92,21 +92,20 @@ class UniversityScheduler:
         for c in courses_to_solve:
             valid_rooms = [r for r in self.rooms if (r['capacity'] * 1.25) >= c.students]
             pref_rooms = [r for r in valid_rooms if r['type'] == c.type]
-            if not pref_rooms: pref_rooms = valid_rooms # Relax room type if needed
+            if not pref_rooms: pref_rooms = valid_rooms 
 
             for d in Config.DAYS:
                 for h in Config.TIME_SLOTS:
                     if h + c.duration > 20: continue
-                    if any(t == 12 for t in range(h, h + c.duration)): continue # No lunch overlap
+                    if any(t == 12 for t in range(h, h + c.duration)): continue
                     
                     for r in pref_rooms:
-                        # Check Busy Slots
                         if any((r['room_name'], d, t) in self.busy_slots for t in range(h, h + c.duration)):
                             continue
                         shifts[(c.uid, d, h, r['room_name'])] = model.NewBoolVar(f'shift_{c.uid}_{d}_{h}_{r["room_name"]}')
 
         # 3. Constraints
-        # C1: Each course happens exactly once
+        # C1: One time per course
         for c in courses_to_solve:
             c_shifts = [shifts[key] for key in shifts if key[0] == c.uid]
             if c_shifts:
@@ -114,17 +113,17 @@ class UniversityScheduler:
             else:
                 self.failed_courses.append(c)
 
-        # Build Time Slot Map for Conflict Checking
+        # Build Map
         time_slot_map = {} 
         
-        # Add Fixed Courses to Map
+        # Add Fixed
         for c, (d, t, r) in self.assignment.items():
             for i in range(c.duration):
                 key = (d, t + i)
                 if key not in time_slot_map: time_slot_map[key] = []
                 time_slot_map[key].append({'type': 'fixed', 'room': r, 'instr': c.instructor, 'grp': (c.major, c.year, c.program)})
 
-        # Add Variable Courses to Map
+        # Add Variables
         for (uid, d, h, r_name), var in shifts.items():
             c = next(x for x in courses_to_solve if x.uid == uid)
             for i in range(c.duration):
@@ -132,24 +131,26 @@ class UniversityScheduler:
                 if key not in time_slot_map: time_slot_map[key] = []
                 time_slot_map[key].append({'type': 'var', 'var': var, 'room': r_name, 'instr': c.instructor, 'grp': (c.major, c.year, c.program)})
 
-        # C2: Conflict Checking
+        # C2: Conflicts
         for slot, items in time_slot_map.items():
-            # 2.1 Room Conflict
+            # 2.1 Room
             rooms_map = {}
             for item in items:
                 r = item['room']
                 if r not in rooms_map: rooms_map[r] = []
                 if item['type'] == 'var': rooms_map[r].append(item['var'])
-                else: rooms_map[r].append(1) # 1 means occupied by fixed course
+                else: rooms_map[r].append(1) 
             
             for r, vars_list in rooms_map.items():
-                if 1 in vars_list: # If fixed course uses this room
+                # *** FIX: ใช้ isinstance แทนการเช็คค่า ***
+                has_fixed = any(isinstance(v, int) and v == 1 for v in vars_list)
+                if has_fixed:
                     for v in vars_list:
-                        if v is not 1: model.Add(v == 0) # *** FIX: use 'is not 1' ***
+                        if not isinstance(v, int): model.Add(v == 0)
                 else:
                     if len(vars_list) > 1: model.Add(sum(vars_list) <= 1)
 
-            # 2.2 Instructor Conflict (Ignore TBA)
+            # 2.2 Instructor
             instr_map = {}
             for item in items:
                 for instr in item['instr'].split(','):
@@ -160,13 +161,14 @@ class UniversityScheduler:
                     else: instr_map[instr].append(1)
             
             for instr, vars_list in instr_map.items():
-                if 1 in vars_list:
+                has_fixed = any(isinstance(v, int) and v == 1 for v in vars_list)
+                if has_fixed:
                     for v in vars_list:
-                        if v is not 1: model.Add(v == 0) # *** FIX ***
+                        if not isinstance(v, int): model.Add(v == 0)
                 else:
                     if len(vars_list) > 1: model.Add(sum(vars_list) <= 1)
 
-            # 2.3 Student Group Conflict
+            # 2.3 Student Group
             grp_map = {}
             for item in items:
                 g = item['grp']
@@ -175,19 +177,20 @@ class UniversityScheduler:
                 else: grp_map[g].append(1)
             
             for g, vars_list in grp_map.items():
-                if 1 in vars_list:
+                has_fixed = any(isinstance(v, int) and v == 1 for v in vars_list)
+                if has_fixed:
                     for v in vars_list:
-                        if v is not 1: model.Add(v == 0) # *** FIX ***
+                        if not isinstance(v, int): model.Add(v == 0)
                 else:
                     if len(vars_list) > 1: model.Add(sum(vars_list) <= 1)
 
-        # 4. Objectives (Soft Constraints)
+        # 4. Objectives
         penalties = []
         for (uid, d, h, r_name), var in shifts.items():
             cost = 0
-            if d in ['Sat', 'Sun']: cost += 500 # Avoid Weekend
-            if h >= 17: cost += 50 # Avoid Night
-            if h >= 16: cost += 10 # Avoid Late
+            if d in ['Sat', 'Sun']: cost += 500 
+            if h >= 17: cost += 50 
+            if h >= 16: cost += 10 
             if cost > 0: penalties.append(var * cost)
             
         if penalties: model.Minimize(sum(penalties))
@@ -203,7 +206,6 @@ class UniversityScheduler:
                     c = next(x for x in courses_to_solve if x.uid == uid)
                     self.assignment[c] = (d, h, r_name)
         
-        # Check failed
         assigned_uids = {c.uid for c in self.assignment}
         for c in courses_to_solve:
             if c.uid not in assigned_uids: self.failed_courses.append(c)
@@ -211,8 +213,7 @@ class UniversityScheduler:
 # ==========================================
 # 🛠️ HELPER: EXTRACT DATA
 # ==========================================
-def extract_data_v21(course_file, room_file, fixed_file, blacklist_codes=[]):
-    # 1. Fixed Schedule
+def extract_data_v22(course_file, room_file, fixed_file, blacklist_codes=[]):
     fixed_map = {} 
     if fixed_file:
         try:
@@ -240,7 +241,6 @@ def extract_data_v21(course_file, room_file, fixed_file, blacklist_codes=[]):
         except: pass
 
     all_courses = []
-    # 2. Course File
     try:
         xls = pd.ExcelFile(course_file)
         for sheet in xls.sheet_names:
@@ -444,7 +444,7 @@ if f_course and f_room:
         with st.spinner("⏳ กำลังคำนวณด้วย Google OR-Tools (อาจใช้เวลา 1-2 นาที)..."):
             try:
                 blacklist = [x.strip() for x in blacklist_input.split(',') if x.strip()]
-                courses, rooms, busy = extract_data_v21(f_course, f_room, f_fixed, blacklist)
+                courses, rooms, busy = extract_data_v22(f_course, f_room, f_fixed, blacklist)
                 
                 if not courses or rooms.empty: st.error("❌ ไม่พบข้อมูลในไฟล์")
                 else:
