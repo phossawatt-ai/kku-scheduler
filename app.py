@@ -7,21 +7,33 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
 
 # ==========================================
-# ⚙️ CONFIG
+# ⚙️ CONFIGURATION
 # ==========================================
 class Config:
     MAJOR_MAP = {
-        'CS': 'วิทยาการคอมพิวเตอร์', 'IT': 'เทคโนโลยีสารสนเทศ',
-        'AI': 'ปัญญาประดิษฐ์', 'GIS': 'ภูมิสารสนเทศศาสตร์',
+        'CS': 'วิทยาการคอมพิวเตอร์', 
+        'IT': 'เทคโนโลยีสารสนเทศ',
+        'AI': 'ปัญญาประดิษฐ์', 
+        'GIS': 'ภูมิสารสนเทศศาสตร์',
         'CYBER': 'ความมั่นคงปลอดภัยไซเบอร์'
     }
+    
     COLOR_MAP = {
-        'SC': 'FFF59D', 'CP': 'B3E5FC', 'LI': 'C8E6C9',
-        'EN': 'C8E6C9', 'GE': 'FFE0B2', 'DEFAULT': 'F5F5F5'
+        'SC': 'FFF59D', # เหลือง
+        'CP': 'B3E5FC', # ฟ้า
+        'LI': 'C8E6C9', # เขียว
+        'EN': 'C8E6C9', 
+        'GE': 'FFE0B2', # ส้ม
+        'DEFAULT': 'F5F5F5' # เทา
     }
+    
     DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-    # คำที่เจอแล้วให้หยุดอ่านทันที (ป้องกันวิชาผีท้ายตาราง)
-    STOP_KEYWORDS = ['วิชาเลือก', 'สรุปจำนวน', 'รวมหน่วยกิต', 'Elective', 'Total']
+    
+    # *** (แก้บั๊ก) เติมตัวแปรนี้กลับมาครับ ***
+    TIME_SLOTS = range(8, 20) 
+    
+    # คำที่เจอแล้วให้หยุดอ่านทันที (ป้องกันวิชาสรุปท้ายตารางหลุดมา)
+    STOP_KEYWORDS = ['วิชาเลือก', 'สรุปจำนวน', 'รวมหน่วยกิต', 'Elective', 'Total', 'สรุป']
 
 # ==========================================
 # 📦 DATA MODELS
@@ -37,12 +49,19 @@ class Course:
         self.type = 'Lab' if row_data.get('lab_hours', 0) > 0 else 'Lec'
         self.year = int(row_data.get('year', 1))
         
-        # Student Count & Duration
+        # Student Count
         base = int(row_data.get('student_count', 0))
         self.students = base if base > 0 else (50 if self.program == 'Reg' else 30)
         
+        # Duration
         raw_dur = int(row_data['lec_hours']) if self.type == 'Lec' else int(row_data['lab_hours'])
         self.duration = min(raw_dur, 4) if raw_dur > 0 else 2
+        
+        # Fixed Schedule Flags
+        self.is_fixed = False
+        self.fixed_day = None
+        self.fixed_time = None
+        self.fixed_room = None
         
         self.related_course = None 
 
@@ -61,8 +80,10 @@ class UniversityScheduler:
         
         self.courses_to_schedule = courses_list
         self._link_courses()
-        # Sort: Hardest to schedule first
-        self.courses_to_schedule.sort(key=lambda x: (-x.students, -x.duration))
+        self._apply_fixed_schedules()
+        
+        # Sort: Fixed first, then Hardest to schedule
+        self.courses_to_schedule.sort(key=lambda x: (not x.is_fixed, -x.students, -x.duration))
 
     def _link_courses(self):
         course_map = {}
@@ -73,7 +94,14 @@ class UniversityScheduler:
                 key = (c.major, c.program, c.code)
                 if key in course_map: c.related_course = course_map[key]
 
+    def _apply_fixed_schedules(self):
+        for c in self.courses_to_schedule:
+            if c.is_fixed and c.fixed_day and c.fixed_time is not None:
+                self.assignment[c] = (c.fixed_day, c.fixed_time, c.fixed_room)
+
     def is_valid(self, course, day, start, room, squeeze=1.25, strict=True, lunch=False):
+        if course.is_fixed: return False 
+        
         end = start + course.duration
         if end > 20: return False
         if not lunch and any(t == 12 for t in range(start, end)): return False
@@ -90,7 +118,6 @@ class UniversityScheduler:
                 if max(start, t) < min(end, t + c.duration):
                     if r == room['room_name']: return False
                     
-                    # Teacher Conflict
                     inst_a = set(course.instructor.split(','))
                     inst_b = set(c.instructor.split(','))
                     if 'TBA' not in inst_a and 'TBA' not in inst_b:
@@ -138,12 +165,42 @@ class UniversityScheduler:
         self.failed_courses = [c for c in self.courses_to_schedule if c not in self.assignment]
 
 # ==========================================
-# 🛠️ HELPER: EXTRACT DATA (Robust Version)
+# 🛠️ HELPER: EXTRACT DATA (Robust V19)
 # ==========================================
-def extract_data_v18(course_file, room_file, blacklist_codes=[]):
+def extract_data_v19(course_file, room_file, fixed_file, blacklist_codes=[]):
+    # 1. Read Fixed Schedule (Optional)
+    fixed_map = {} 
+    if fixed_file:
+        try:
+            xls_fix = pd.ExcelFile(fixed_file)
+            for sheet in xls_fix.sheet_names:
+                df_fix = pd.read_excel(fixed_file, sheet_name=sheet)
+                df_fix.columns = df_fix.columns.astype(str).str.lower()
+                
+                col_code = next((c for c in df_fix.columns if 'รหัส' in c or 'code' in c), None)
+                col_day = next((c for c in df_fix.columns if 'วัน' in c or 'day' in c), None)
+                col_time = next((c for c in df_fix.columns if 'เวลา' in c or 'time' in c), None)
+                col_room = next((c for c in df_fix.columns if 'ห้อง' in c or 'room' in c), None)
+                
+                if col_code and col_day and col_time:
+                    for _, row in df_fix.iterrows():
+                        c_code = str(row[col_code]).replace(" ", "").strip()
+                        c_day = str(row[col_day]).strip()
+                        c_time = str(row[col_time]).strip()
+                        c_room = str(row[col_room]) if col_room else "External"
+                        
+                        d_map = {'จันทร์':'Mon', 'อังคาร':'Tue', 'พุธ':'Wed', 'พฤหัส':'Thu', 'ศุกร์':'Fri', 'เสาร์':'Sat', 'อาทิตย์':'Sun'}
+                        day_en = next((en for th, en in d_map.items() if th in c_day), None)
+                        time_match = re.search(r'(\d+)', c_time)
+                        start_h = int(time_match.group(1)) if time_match else None
+                        
+                        if day_en and start_h:
+                            fixed_map[c_code] = {'day': day_en, 'time': start_h, 'room': c_room}
+        except: pass
+
     all_courses = []
     
-    # 1. Course File
+    # 2. Course File
     try:
         xls = pd.ExcelFile(course_file)
         for sheet in xls.sheet_names:
@@ -152,10 +209,10 @@ def extract_data_v18(course_file, room_file, blacklist_codes=[]):
             
             df = pd.read_excel(course_file, sheet_name=sheet, header=None)
             
-            # --- Fix GIS Empty: More aggressive split search ---
-            split_idx = len(df.columns) // 2 # Default Fallback
+            # --- Aggressive Split Search (แก้ปัญหา GIS โล่ง) ---
+            split_idx = len(df.columns) // 2 
             found_split = False
-            for r in range(min(20, len(df))): # Scan deeper (20 rows)
+            for r in range(min(20, len(df))):
                 row_txt = "".join([str(x) for x in df.iloc[r].values])
                 if "ภาคปลาย" in row_txt or "การศึกษาที่ 2" in row_txt or "Semester 2" in row_txt:
                     for c in range(len(df.columns)):
@@ -165,18 +222,16 @@ def extract_data_v18(course_file, room_file, blacklist_codes=[]):
                     if found_split: break
             
             current_year = 1
-            stop_reading = False # Flag to stop reading ghost courses
+            stop_reading = False 
             
             for _, row in df.iterrows():
                 row_str = " ".join([str(x) for x in row.values if str(x) != 'nan']).strip()
                 
-                # --- Stop Word Check ---
+                # --- Stop Word (แก้ปัญหาวิชาผีท้ายตาราง) ---
                 if any(kw in row_str for kw in Config.STOP_KEYWORDS):
                     stop_reading = True
-                
-                if stop_reading: continue # Skip the rest of the sheet
+                if stop_reading: continue 
 
-                # Detect Year
                 if len(row_str) < 100 and "หน่วยกิต" not in row_str:
                     ym = re.search(r'ปี.*?(\d)', row_str)
                     if ym and 1 <= int(ym.group(1)) <= 4: current_year = int(ym.group(1))
@@ -187,7 +242,7 @@ def extract_data_v18(course_file, room_file, blacklist_codes=[]):
                     for i, m in enumerate(matches):
                         code = m.group(1).replace(" ", "")
                         
-                        # --- Blacklist Filter ---
+                        # --- Blacklist Filter (กรองรหัสวิชาที่ไม่ต้องการ) ---
                         if code in blacklist_codes: continue 
 
                         y = current_year
@@ -213,17 +268,23 @@ def extract_data_v18(course_file, room_file, blacklist_codes=[]):
                         
                         name_clean = re.sub(r'\(.*?\)', '', name_raw).strip()
                         if len(name_clean) > 2:
-                            # Create Reg & Sp courses
-                            res.append(Course({
-                                'major': major, 'program': 'Reg', 'year': y, 'semester': semester,
-                                'code': code, 'name': name_clean, 'lec_hours': lec, 'lab_hours': lab,
-                                'student_count': cnt if cnt > 0 else 50, 'instructor': instr
-                            }))
-                            res.append(Course({
-                                'major': major, 'program': 'Sp', 'year': y, 'semester': semester,
-                                'code': code, 'name': name_clean, 'lec_hours': lec, 'lab_hours': lab,
-                                'student_count': 30, 'instructor': instr
-                            }))
+                            for prog in ['Reg', 'Sp']:
+                                c_obj = Course({
+                                    'major': major, 'program': prog, 'year': y, 'semester': semester,
+                                    'code': code, 'name': name_clean, 'lec_hours': lec, 'lab_hours': lab,
+                                    'student_count': cnt if cnt > 0 else (50 if prog=='Reg' else 30), 
+                                    'instructor': instr
+                                })
+                                
+                                # Apply Fixed
+                                if code in fixed_map:
+                                    fix = fixed_map[code]
+                                    c_obj.is_fixed = True
+                                    c_obj.fixed_day = fix['day']
+                                    c_obj.fixed_time = fix['time']
+                                    c_obj.fixed_room = fix['room']
+                                
+                                res.append(c_obj)
                     return res
 
                 s1 = " ".join([str(x) for x in row.iloc[:split_idx].values if str(x) != 'nan'])
@@ -232,7 +293,7 @@ def extract_data_v18(course_file, room_file, blacklist_codes=[]):
                 all_courses.extend(parse_segment(s2, 2))
     except Exception as e: st.error(f"Course Read Error: {e}")
 
-    # 2. Room File
+    # 3. Room File
     rooms, busy = [], []
     try:
         xls = pd.ExcelFile(room_file)
@@ -348,9 +409,10 @@ st.set_page_config(page_title="KKU Scheduler Pro", layout="wide")
 st.title("🎓 ระบบจัดตารางเรียนอัตโนมัติ (KKU AI Scheduler)")
 st.info("ระบบจัดการภาคปกติ/พิเศษ แยกอิสระ และกรองวิชาผี (Ghost Courses) ออกอัตโนมัติ")
 
-c1, c2 = st.columns(2)
+c1, c2, c3 = st.columns(3)
 f_course = c1.file_uploader("1. ไฟล์หลักสูตร (kku30...)", type=['xlsx'])
 f_room = c2.file_uploader("2. ไฟล์ห้องเรียน (LAB...)", type=['xlsx'])
+f_fixed = c3.file_uploader("3. ไฟล์วิชาต่างคณะ (Optional)", type=['xlsx'])
 
 # *** NEW: ช่องกรอกวิชาผี ***
 blacklist_input = st.text_area("🚫 รายวิชาที่ต้องการลบออก (พิมพ์รหัสวิชา คั่นด้วยจุลภาค)", 
@@ -363,7 +425,7 @@ if f_course and f_room:
                 # แปลง Blacklist เป็น List
                 blacklist = [x.strip() for x in blacklist_input.split(',') if x.strip()]
                 
-                courses, rooms, busy = extract_data_v18(f_course, f_room, blacklist)
+                courses, rooms, busy = extract_data_v19(f_course, f_room, f_fixed, blacklist)
                 
                 if not courses or rooms.empty: st.error("❌ ไม่พบข้อมูลในไฟล์")
                 else:
