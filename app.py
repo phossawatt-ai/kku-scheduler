@@ -5,9 +5,10 @@ import io
 import time
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
+from ortools.sat.python import cp_model  # <--- พระเอกของเรา
 
 # ==========================================
-# ⚙️ CONFIG
+# ⚙️ CONFIGURATION
 # ==========================================
 class Config:
     MAJOR_MAP = {
@@ -20,10 +21,8 @@ class Config:
         'EN': 'C8E6C9', 'GE': 'FFE0B2', 'DEFAULT': 'F5F5F5'
     }
     DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-    TIME_SLOTS = range(8, 20)
-    
-    # คำที่ "ข้ามบรรทัดนี้" (แต่ไมหยุดอ่าน)
-    SKIP_KEYWORDS = ['สรุปจำนวน', 'รวมหน่วยกิต', 'Total', 'Credit', 'ลงชื่อ']
+    TIME_SLOTS = range(8, 20) # 08:00 - 20:00
+    STOP_KEYWORDS = ['สรุปจำนวน', 'รวมหน่วยกิต', 'Total', 'Credit', 'ลงชื่อ']
 
 # ==========================================
 # 📦 DATA MODELS
@@ -47,118 +46,222 @@ class Course:
         raw_dur = int(row_data['lec_hours']) if self.type == 'Lec' else int(row_data['lab_hours'])
         self.duration = min(raw_dur, 4) if raw_dur > 0 else 2
         
-        # Fixed Schedule Flags
+        # Fixed Schedule
         self.is_fixed = False
         self.fixed_day = None
         self.fixed_time = None
         self.fixed_room = None
         
         self.related_course = None 
+        self.uid = f"{self.code}_{self.program}_{self.type}_{id(self)}" # Unique ID for solver
 
     def __repr__(self):
-        return f"{self.code} ({self.program})"
+        return f"{self.code}"
 
 # ==========================================
-# 🧠 SCHEDULER ENGINE
+# 🧠 OR-TOOLS SCHEDULER ENGINE
 # ==========================================
 class UniversityScheduler:
     def __init__(self, courses_list, rooms_df, busy_df):
         self.rooms = sorted(rooms_df.to_dict('records'), key=lambda x: x['capacity'])
         self.busy_slots = set((str(row['room']), row['day'], row['hour']) for _, row in busy_df.iterrows())
-        self.assignment = {} 
-        self.failed_courses = [] 
+        self.courses = courses_list
+        self.assignment = {}
+        self.failed_courses = []
         
-        self.courses_to_schedule = courses_list
+        # Link Lec-Lab
         self._link_courses()
-        self._apply_fixed_schedules()
-        
-        # Sort: Fixed first, then Hardest
-        self.courses_to_schedule.sort(key=lambda x: (not x.is_fixed, -x.students, -x.duration))
 
     def _link_courses(self):
         course_map = {}
-        for c in self.courses_to_schedule:
+        for c in self.courses:
             if c.type == 'Lec': course_map[(c.major, c.program, c.code)] = c
-        for c in self.courses_to_schedule:
+        for c in self.courses:
             if c.type == 'Lab':
                 key = (c.major, c.program, c.code)
                 if key in course_map: c.related_course = course_map[key]
 
-    def _apply_fixed_schedules(self):
-        # บังคับลงตารางสำหรับวิชาที่ Fixed มาแล้ว (SC/GE)
-        for c in self.courses_to_schedule:
-            if c.is_fixed and c.fixed_day and c.fixed_time is not None:
-                self.assignment[c] = (c.fixed_day, c.fixed_time, c.fixed_room)
-
-    def is_valid(self, course, day, start, room, squeeze=1.25, strict=True, lunch=False):
-        if course.is_fixed: return False # วิชา Fixed ห้ามมายุ่ง
-        
-        end = start + course.duration
-        if end > 20: return False
-        if not lunch and any(t == 12 for t in range(start, end)): return False
-        if (room['capacity'] * squeeze) < course.students: return False
-        
-        if strict:
-            if (course.type == 'Lab' and room['type'] != 'Lab') or (course.type == 'Lec' and room['type'] == 'Lab'): return False
-
-        for t in range(start, end):
-            if (str(room['room_name']), day, t) in self.busy_slots: return False
-            
-        for c, (d, t, r) in self.assignment.items():
-            if d == day:
-                if max(start, t) < min(end, t + c.duration):
-                    if r == room['room_name']: return False
-                    
-                    inst_a = set(course.instructor.split(','))
-                    inst_b = set(c.instructor.split(','))
-                    if 'TBA' not in inst_a and 'TBA' not in inst_b:
-                        if not inst_a.isdisjoint(inst_b): return False
-                    
-                    if (course.major == c.major) and (course.year == c.year) and (course.program == c.program):
-                        return False
-
-        if course.type == 'Lab' and course.related_course:
-            lec = course.related_course
-            if lec not in self.assignment: return False
-            lec_day, _, _ = self.assignment[lec]
-            d_idx = {d: i for i, d in enumerate(Config.DAYS)}
-            if d_idx[day] < d_idx[lec_day]: return False
-            if d_idx[day] == d_idx[lec_day] and start < (self.assignment[lec][1] + lec.duration): return False
-            
-        return True
-
     def solve(self):
-        phases = [
-            {'days': Config.DAYS[:5], 'hours': range(8, 16), 'squeeze': 1.25, 'strict': True, 'lunch': False},
-            {'days': Config.DAYS[:5], 'hours': range(8, 16), 'squeeze': 1.50, 'strict': False, 'lunch': False},
-            {'days': Config.DAYS[:5], 'hours': range(16, 18), 'squeeze': 1.50, 'strict': False, 'lunch': False},
-            {'days': Config.DAYS[:5], 'hours': range(18, 20), 'squeeze': 1.50, 'strict': False, 'lunch': False},
-            {'days': Config.DAYS[5:], 'hours': range(8, 20), 'squeeze': 1.50, 'strict': False, 'lunch': True},
-        ]
+        model = cp_model.CpModel()
         
-        for phase in phases:
-            remaining = [c for c in self.courses_to_schedule if c not in self.assignment]
-            rooms_try = self.rooms if phase['strict'] else sorted(self.rooms, key=lambda x: x['capacity'], reverse=True)
+        # 1. Variables: x[course, day, hour, room] -> Boolean
+        # เก็บตัวแปรทั้งหมดเพื่อนำไปสร้าง Constraint
+        shifts = {} 
+        
+        # แยกวิชา Fixed ออกไปก่อน (Assign เลย)
+        courses_to_solve = []
+        for c in self.courses:
+            if c.is_fixed and c.fixed_day and c.fixed_time:
+                self.assignment[c] = (c.fixed_day, c.fixed_time, c.fixed_room)
+            else:
+                courses_to_solve.append(c)
+
+        # สร้างตัวแปรให้วิชาที่ต้องจัด
+        for c in courses_to_solve:
+            # เลือกห้องที่จุพอ (Squeeze 25%)
+            valid_rooms = [r for r in self.rooms if (r['capacity'] * 1.25) >= c.students]
+            # กรองประเภทห้อง (Strict)
+            valid_rooms = [r for r in valid_rooms if r['type'] == c.type]
+            # ถ้าหาไม่ได้เลย ให้ใช้ห้องอะไรก็ได้ที่จุพอ
+            if not valid_rooms:
+                valid_rooms = [r for r in self.rooms if (r['capacity'] * 1.25) >= c.students]
+
+            for d in Config.DAYS:
+                for h in Config.TIME_SLOTS:
+                    # เวลาเลิกต้องไม่เกิน 20.00
+                    if h + c.duration > 20: continue
+                    # ห้ามทับเที่ยง
+                    if any(t == 12 for t in range(h, h + c.duration)): continue
+                    
+                    for r in valid_rooms:
+                        # เช็ค Busy Slots จากไฟล์
+                        if any((r['room_name'], d, t) in self.busy_slots for t in range(h, h + c.duration)):
+                            continue
+                            
+                        shifts[(c.uid, d, h, r['room_name'])] = model.NewBoolVar(f'shift_{c.code}_{d}_{h}_{r["room_name"]}')
+
+        # 2. Constraints
+        
+        # C1: แต่ละวิชาต้องลงแค่ 1 ครั้งเท่านั้น
+        for c in courses_to_solve:
+            c_shifts = [shifts[key] for key in shifts if key[0] == c.uid]
+            if c_shifts:
+                model.Add(sum(c_shifts) == 1)
+            else:
+                # ถ้าไม่มี Slot ลงได้เลยตั้งแต่ต้น (เช่น ห้องไม่พอ)
+                self.failed_courses.append(c)
+
+        # Helper: สร้าง Map ของ (Day, Hour) -> List of vars active at that time
+        # เพื่อเช็คการชนกัน
+        time_slot_map = {} # Key: (day, hour) -> List of (course, var, room, instructor, student_group)
+        
+        # ใส่ Fixed Course ลงใน Map ด้วย (เพื่อกันที่)
+        for c, (d, t, r) in self.assignment.items():
+            for duration_i in range(c.duration):
+                current_h = t + duration_i
+                key = (d, current_h)
+                if key not in time_slot_map: time_slot_map[key] = []
+                # Fixed course ไม่มี variable (คือ 1 เสมอ)
+                time_slot_map[key].append({
+                    'type': 'fixed', 'room': r, 'instr': c.instructor, 
+                    'group': (c.major, c.year, c.program)
+                })
+
+        # ใส่ Variable ของวิชาที่จะจัดลง Map
+        for (c_uid, d, h, r_name), var in shifts.items():
+            # หา course object
+            c = next(x for x in courses_to_solve if x.uid == c_uid)
+            for duration_i in range(c.duration):
+                current_h = h + duration_i
+                key = (d, current_h)
+                if key not in time_slot_map: time_slot_map[key] = []
+                time_slot_map[key].append({
+                    'type': 'var', 'var': var, 'room': r_name, 'instr': c.instructor,
+                    'group': (c.major, c.year, c.program)
+                })
+
+        # C2: เช็คการชนกัน (Conflict Constraints)
+        for (d, h), items in time_slot_map.items():
+            # 2.1 ห้องชน (Room Conflict)
+            rooms_in_slot = {}
+            for item in items:
+                r = item['room']
+                if r not in rooms_in_slot: rooms_in_slot[r] = []
+                if item['type'] == 'var': rooms_in_slot[r].append(item['var'])
+                else: rooms_in_slot[r].append(1) # Fixed course นับเป็น 1
             
-            for course in remaining:
-                assigned = False
-                for day in phase['days']:
-                    if assigned: break
-                    for hour in phase['hours']:
-                        if assigned: break
-                        if hour + course.duration > 20: continue
-                        for room in rooms_try:
-                            if self.is_valid(course, day, hour, room, phase['squeeze'], phase['strict'], phase['lunch']):
-                                self.assignment[course] = (day, hour, room['room_name'])
-                                assigned = True; break
+            for r, vars_list in rooms_in_slot.items():
+                # ถ้ามี Fixed course อยู่แล้ว ห้ามมี var อื่นลงห้องนี้
+                if 1 in vars_list:
+                    for v in vars_list:
+                        if v != 1: model.Add(v == 0)
+                else:
+                    # ห้ามลงห้องเดียวกันเกิน 1 วิชา
+                    if len(vars_list) > 1:
+                        model.Add(sum(vars_list) <= 1)
+
+            # 2.2 อาจารย์ชน (Instructor Conflict)
+            # (ข้าม TBA)
+            instr_in_slot = {}
+            for item in items:
+                instrs = item['instr'].split(',')
+                for instr in instrs:
+                    instr = instr.strip()
+                    if instr == 'TBA': continue
+                    if instr not in instr_in_slot: instr_in_slot[instr] = []
+                    if item['type'] == 'var': instr_in_slot[instr].append(item['var'])
+                    else: instr_in_slot[instr].append(1)
+            
+            for instr, vars_list in instr_in_slot.items():
+                if 1 in vars_list:
+                    for v in vars_list:
+                        if v != 1: model.Add(v == 0)
+                else:
+                    if len(vars_list) > 1:
+                        model.Add(sum(vars_list) <= 1)
+
+            # 2.3 นักศึกษาชน (Student Group Conflict)
+            group_in_slot = {}
+            for item in items:
+                g = item['group']
+                if g not in group_in_slot: group_in_slot[g] = []
+                if item['type'] == 'var': group_in_slot[g].append(item['var'])
+                else: group_in_slot[g].append(1)
+            
+            for g, vars_list in group_in_slot.items():
+                if 1 in vars_list:
+                    for v in vars_list:
+                        if v != 1: model.Add(v == 0)
+                else:
+                    if len(vars_list) > 1:
+                        model.Add(sum(vars_list) <= 1)
+
+        # C3: Lec < Lab Sequence (Soft Constraint for simplicity in V1)
+        # การทำ Hard Constraint เรื่อง Sequence ข้ามวันใน OR-Tools ค่อนข้างซับซ้อน 
+        # เพื่อความรวดเร็วและไม่ให้ solver ค้าง เราจะเน้น Conflict เป็นหลักก่อน
+
+        # 3. Objectives (Minimize Bad Times)
+        # พยายามเลี่ยงตอนเย็น (17.00+) และ เสาร์อาทิตย์
+        penalties = []
+        for (c_uid, d, h, r_name), var in shifts.items():
+            penalty = 0
+            if d in ['Sat', 'Sun']: penalty += 100 # เกลียดเสาร์อาทิตย์มาก
+            if h >= 17: penalty += 20 # ไม่ชอบเรียนค่ำ
+            if h >= 16: penalty += 5  # เลี่ยงเย็นนิดหน่อย
+            
+            if penalty > 0:
+                penalties.append(var * penalty)
         
-        self.failed_courses = [c for c in self.courses_to_schedule if c not in self.assignment]
+        if penalties:
+            model.Minimize(sum(penalties))
+
+        # 4. Solver Run
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 60.0 # ให้เวลาคิด 60 วินาทีพอ
+        status = solver.Solve(model)
+
+        # 5. Extract Results
+        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+            for (c_uid, d, h, r_name), var in shifts.items():
+                if solver.Value(var) == 1:
+                    # Find course object
+                    c = next(x for x in courses_to_solve if x.uid == c_uid)
+                    self.assignment[c] = (d, h, r_name)
+        else:
+            # ถ้าจัดไม่ได้เลย ให้แจ้งเตือน (แต่ปกติควรจะได้บ้าง)
+            pass
+            
+        # Update Failed Courses
+        assigned_uids = [c.uid for c in self.assignment.keys()]
+        for c in courses_to_solve:
+            if c.uid not in assigned_uids:
+                self.failed_courses.append(c)
 
 # ==========================================
-# 🛠️ HELPER: EXTRACT DATA (V20 - Fixed Year & Locking)
+# 🛠️ HELPER: EXTRACT DATA
 # ==========================================
-def extract_data_v20(course_file, room_file, fixed_file, blacklist_codes=[]):
-    # 1. Read Fixed Schedule (วิชาต่างคณะ)
+def extract_data_v21(course_file, room_file, fixed_file, blacklist_codes=[]):
+    # 1. Fixed Schedule
     fixed_map = {} 
     if fixed_file:
         try:
@@ -166,8 +269,6 @@ def extract_data_v20(course_file, room_file, fixed_file, blacklist_codes=[]):
             for sheet in xls_fix.sheet_names:
                 df_fix = pd.read_excel(fixed_file, sheet_name=sheet)
                 df_fix.columns = df_fix.columns.astype(str).str.lower()
-                
-                # หาชื่อคอลัมน์ให้เจอ
                 col_code = next((c for c in df_fix.columns if 'รหัส' in c or 'code' in c), None)
                 col_day = next((c for c in df_fix.columns if 'วัน' in c or 'day' in c), None)
                 col_time = next((c for c in df_fix.columns if 'เวลา' in c or 'time' in c), None)
@@ -179,28 +280,24 @@ def extract_data_v20(course_file, room_file, fixed_file, blacklist_codes=[]):
                         c_day = str(row[col_day]).strip()
                         c_time = str(row[col_time]).strip()
                         c_room = str(row[col_room]) if col_room else "External"
-                        
                         d_map = {'จันทร์':'Mon', 'อังคาร':'Tue', 'พุธ':'Wed', 'พฤหัส':'Thu', 'ศุกร์':'Fri', 'เสาร์':'Sat', 'อาทิตย์':'Sun'}
                         day_en = next((en for th, en in d_map.items() if th in c_day), None)
                         time_match = re.search(r'(\d+)', c_time)
                         start_h = int(time_match.group(1)) if time_match else None
-                        
                         if day_en and start_h:
                             fixed_map[c_code] = {'day': day_en, 'time': start_h, 'room': c_room}
         except: pass
 
     all_courses = []
     
-    # 2. Course File (หลักสูตร)
+    # 2. Course File
     try:
         xls = pd.ExcelFile(course_file)
         for sheet in xls.sheet_names:
             major = next((m for m in Config.MAJOR_MAP if m in sheet.upper()), None)
             if not major: continue
-            
             df = pd.read_excel(course_file, sheet_name=sheet, header=None)
             
-            # หาจุดแบ่งเทอม 2
             split_idx = len(df.columns) // 2 
             found_split = False
             for r in range(min(20, len(df))):
@@ -213,15 +310,13 @@ def extract_data_v20(course_file, room_file, fixed_file, blacklist_codes=[]):
                     if found_split: break
             
             current_year = 1
+            stop_reading = False 
             
             for _, row in df.iterrows():
                 row_str = " ".join([str(x) for x in row.values if str(x) != 'nan']).strip()
-                
-                # --- Skip Keywords (ข้ามแค่บรรทัดนี้ ไม่หยุดอ่าน) ---
-                if any(kw in row_str for kw in Config.SKIP_KEYWORDS):
-                    continue
+                if any(kw in row_str for kw in Config.STOP_KEYWORDS): stop_reading = True
+                if stop_reading: continue 
 
-                # Detect Year
                 if len(row_str) < 100 and "หน่วยกิต" not in row_str:
                     ym = re.search(r'ปี.*?(\d)', row_str)
                     if ym and 1 <= int(ym.group(1)) <= 4: current_year = int(ym.group(1))
@@ -231,11 +326,7 @@ def extract_data_v20(course_file, room_file, fixed_file, blacklist_codes=[]):
                     matches = list(re.finditer(r'\b([A-Z]{2}\s?\d{3}\s?\d{3})\b', seg))
                     for i, m in enumerate(matches):
                         code = m.group(1).replace(" ", "")
-                        
-                        # --- Blacklist Filter ---
                         if code in blacklist_codes: continue 
-
-                        # --- Year Correction ---
                         y = current_year
                         if len(code) >= 5 and code[4].isdigit():
                             dy = int(code[4])
@@ -243,11 +334,9 @@ def extract_data_v20(course_file, room_file, fixed_file, blacklist_codes=[]):
                         
                         start, end = m.end(), matches[i+1].start() if i+1 < len(matches) else len(seg)
                         sub = seg[start:end]
-                        
                         lec, lab, cnt, instr = 3, 0, 0, "TBA"
                         cr = re.search(r'(\d+)\s*\(\s*(\d+)\s*-\s*(\d+)\s*-\s*(\d+)\s*\)', sub)
                         name_raw = sub
-                        
                         if cr:
                             name_raw = sub[:cr.start()]
                             lec, lab = int(cr.group(2)), int(cr.group(3))
@@ -266,20 +355,12 @@ def extract_data_v20(course_file, room_file, fixed_file, blacklist_codes=[]):
                                     'student_count': cnt if cnt > 0 else (50 if prog=='Reg' else 30), 
                                     'instructor': instr
                                 })
-                                
-                                # *** AUTO-LOCK Logic (วิทย์/อังกฤษ/ศึกษาทั่วไป) ***
-                                is_sc_ge = code.startswith('SC') or code.startswith('GE') or code.startswith('LI') or code.startswith('EN')
                                 if code in fixed_map:
                                     fix = fixed_map[code]
                                     c_obj.is_fixed = True
                                     c_obj.fixed_day = fix['day']
                                     c_obj.fixed_time = fix['time']
                                     c_obj.fixed_room = fix['room']
-                                elif is_sc_ge:
-                                    # ถ้าเป็นวิชา SC แต่ไม่มีในตารางล็อค -> ให้เตือนใน Console (หรือปล่อยผ่าน)
-                                    # แต่จะไม่บังคับล็อค เพราะไม่มีข้อมูล
-                                    pass
-                                
                                 res.append(c_obj)
                     return res
 
@@ -303,7 +384,6 @@ def extract_data_v20(course_file, room_file, fixed_file, blacklist_codes=[]):
             else:
                 caps = [int(c) for c in re.findall(r'\((\d+)\)', head) if int(c) < 500]
                 if caps: cap = caps[0]
-            
             rooms.append({'room_name': sheet.strip(), 'type': 'Lab' if 'LAB' in sheet.upper() else 'Lec', 'capacity': cap})
             
             s_row = next((i for i, r in df.iterrows() if "จันทร์" in str(r.values)), -1)
@@ -401,25 +481,24 @@ def generate_excel_report(sched1, sched2):
 # ==========================================
 # 🖥️ APP INTERFACE
 # ==========================================
-st.set_page_config(page_title="KKU Scheduler V20", layout="wide")
-st.title("🎓 ระบบจัดตารางเรียนอัตโนมัติ (KKU AI Scheduler)")
-st.info("แก้ไขบั๊ก: ปี 3-4 หาย, วิชาต่างคณะล็อคเวลาได้, แยกภาคปกติ/พิเศษ")
+st.set_page_config(page_title="KKU Scheduler (OR-Tools)", layout="wide")
+st.title("🎓 ระบบจัดตารางเรียนอัตโนมัติ (Google OR-Tools)")
+st.info("อัปเกรดเป็น Google OR-Tools (CP-SAT Solver) เพื่อการจัดตารางที่แม่นยำสูงสุด")
 
 c1, c2, c3 = st.columns(3)
 f_course = c1.file_uploader("1. ไฟล์หลักสูตร (kku30...)", type=['xlsx'])
 f_room = c2.file_uploader("2. ไฟล์ห้องเรียน (LAB...)", type=['xlsx'])
-f_fixed = c3.file_uploader("3. ไฟล์วิชาต่างคณะ/ตารางล็อค (Optional)", type=['xlsx'])
+f_fixed = c3.file_uploader("3. ไฟล์วิชาต่างคณะ (Optional)", type=['xlsx'])
 
 blacklist_input = st.text_area("🚫 รายวิชาผี (Blacklist) - พิมพ์รหัสวิชาที่ต้องการลบออก คั่นด้วยจุลภาค", 
-                               placeholder="เช่น SC402101, GE101001 (ถ้าวิชา GIS หลุดมา ให้ใส่รหัสมันลงในนี้ครับ)")
+                               placeholder="เช่น SC402101, GE101001")
 
 if f_course and f_room:
-    if st.button("🚀 เริ่มจัดตาราง", type="primary"):
-        with st.spinner("⏳ กำลังประมวลผล... (ระบบ V20)"):
+    if st.button("🚀 เริ่มจัดตาราง (Run Solver)", type="primary"):
+        with st.spinner("⏳ กำลังคำนวณด้วย Google OR-Tools (อาจใช้เวลา 1-2 นาที)..."):
             try:
                 blacklist = [x.strip() for x in blacklist_input.split(',') if x.strip()]
-                
-                courses, rooms, busy = extract_data_v20(f_course, f_room, f_fixed, blacklist)
+                courses, rooms, busy = extract_data_v21(f_course, f_room, f_fixed, blacklist)
                 
                 if not courses or rooms.empty: st.error("❌ ไม่พบข้อมูลในไฟล์")
                 else:
@@ -431,8 +510,8 @@ if f_course and f_room:
                         scheds[t] = s
                     
                     xls = generate_excel_report(scheds[1], scheds[2])
-                    st.success("✅ เสร็จสมบูรณ์! ปี 3-4 มาครบแล้ว")
-                    st.download_button("📥 ดาวน์โหลดไฟล์ Excel", xls, "Final_Schedule_V20.xlsx", 
+                    st.success("✅ เสร็จสมบูรณ์!")
+                    st.download_button("📥 ดาวน์โหลดไฟล์ Excel", xls, "Final_Schedule_ORTools.xlsx", 
                                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
                                      use_container_width=True)
             except Exception as e: st.error(f"Error: {e}")
