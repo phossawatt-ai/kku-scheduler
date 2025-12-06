@@ -25,12 +25,13 @@ class Config:
     TIME_SLOTS = range(8, 20)
 
 # ==========================================
-# 📦 DATA MODELS
+# 📦 DATA MODELS (แก้ไข Course Class)
 # ==========================================
 class Course:
     def __init__(self, row_data):
         self.major = row_data['major']
-        self.program = row_data['program'] # Reg / Sp
+        self.semester = row_data['semester']  # <--- เพิ่มบรรทัดนี้ (แก้บั๊ก)
+        self.program = row_data['program']    # Reg / Sp
         self.code = row_data['code']
         self.name = row_data['name']
         self.instructor = str(row_data.get('instructor', 'TBA'))
@@ -38,7 +39,6 @@ class Course:
         self.year = int(row_data.get('year', 1))
         
         # Logic: จำนวนนักศึกษา (แยกตามภาค)
-        # ถ้าไม่มีข้อมูลระบุชัดเจน ให้ใช้ค่า Default ต่างกัน
         base_count = int(row_data.get('student_count', 0))
         if base_count == 0:
             self.students = 50 if self.program == 'Reg' else 30
@@ -50,7 +50,7 @@ class Course:
         self.duration = min(raw_duration, 4)
         if self.duration == 0: self.duration = 2
         
-        # ID ต้องไม่ซ้ำกันระหว่างภาค
+        # ID ไม่ซ้ำ
         self.id = f"{self.major}-{self.program}-{self.code}-{self.type}"
         self.related_course = None 
 
@@ -62,25 +62,23 @@ class Course:
 # ==========================================
 class UniversityScheduler:
     def __init__(self, courses_list, rooms_df, busy_df):
-        # Rooms: Sort Small -> Large
         self.rooms = sorted(rooms_df.to_dict('records'), key=lambda x: x['capacity'])
         self.busy_slots = set((str(row['room']), row['day'], row['hour']) for _, row in busy_df.iterrows())
-        self.assignment = {} # {course: (day, start_time, room)}
+        self.assignment = {} 
         self.failed_courses = []
         
-        # Link Lec-Lab (ภายในภาคเดียวกันเท่านั้น)
+        # Link Lec-Lab
         self.courses_to_schedule = courses_list
         self._link_courses()
         
-        # Sort: คนเยอะ + เรียนยาว -> ลงก่อน
+        # Sort
         self.courses_to_schedule.sort(key=lambda x: (-x.students, -x.duration))
 
     def _link_courses(self):
-        # จับคู่ Lec-Lab ที่เป็นวิชาเดียวกันและภาคเดียวกัน
         course_map = {}
         for c in self.courses_to_schedule:
             if c.type == 'Lec':
-                key = (c.major, c.program, c.code) # Key ต้องมี Program ด้วย
+                key = (c.major, c.program, c.code)
                 course_map[key] = c
         
         for c in self.courses_to_schedule:
@@ -92,48 +90,36 @@ class UniversityScheduler:
     def is_valid(self, course, day, start, room, squeeze=1.25, strict=True, lunch=False):
         end = start + course.duration
         
-        # 1. Basic Constraints
         if end > 20: return False
         if not lunch and any(t == 12 for t in range(start, end)): return False
         if (room['capacity'] * squeeze) < course.students: return False
         
-        # 2. Room Type
         if strict:
             if (course.type == 'Lab' and room['type'] != 'Lab') or (course.type == 'Lec' and room['type'] == 'Lab'): return False
 
-        # 3. Busy Slots (ห้องไม่ว่างจากไฟล์ห้อง)
         for t in range(start, end):
             if (str(room['room_name']), day, t) in self.busy_slots: return False
             
-        # 4. Conflict with Assigned Courses
         for c, (d, t, r) in self.assignment.items():
             if d == day:
-                # ช่วงเวลาทับกัน
                 if max(start, t) < min(end, t + c.duration):
-                    # A. ห้องชน
                     if r == room['room_name']: return False
                     
-                    # B. อาจารย์ชน (สอนพร้อมกันไม่ได้ ไม่ว่าจะภาคไหน)
                     inst_a = set(course.instructor.split(','))
                     inst_b = set(c.instructor.split(','))
                     if 'TBA' not in inst_a and 'TBA' not in inst_b:
                         if not inst_a.isdisjoint(inst_b): return False
                     
-                    # C. นักศึกษาชน (กลุ่มเดียวกัน ห้ามเรียนซ้อน)
-                    # ต้องเป็น Major เดียวกัน + Year เดียวกัน + Program เดียวกัน
+                    # Student Conflict (Major + Year + Program ต้องตรงกันถึงจะชน)
                     if (course.major == c.major) and (course.year == c.year) and (course.program == c.program):
                         return False
 
-        # 5. Lec < Lab Sequence
         if course.type == 'Lab' and course.related_course:
             lec = course.related_course
-            if lec not in self.assignment: return False # Lec ต้องลงก่อน
+            if lec not in self.assignment: return False
             lec_day, _, _ = self.assignment[lec]
             d_idx = {d: i for i, d in enumerate(Config.DAYS)}
-            
-            # Lab ต้องไม่เรียนก่อน Lec (ในสัปดาห์)
             if d_idx[day] < d_idx[lec_day]: return False
-            # ถ้าวันเดียวกัน ต้องเรียนทีหลัง
             if d_idx[day] == d_idx[lec_day] and start < (self.assignment[lec][1] + lec.duration): return False
             
         return True
@@ -166,12 +152,12 @@ class UniversityScheduler:
         self.failed_courses = [c for c in self.courses_to_schedule if c not in self.assignment]
 
 # ==========================================
-# 🛠️ HELPER: EXTRACT DATA (แยกภาคปกติ/พิเศษ)
+# 🛠️ HELPER: EXTRACT DATA
 # ==========================================
 def extract_data_from_files(course_file, room_file):
     all_courses = []
     
-    # --- 1. อ่านไฟล์หลักสูตร ---
+    # 1. Course File
     try:
         xls = pd.ExcelFile(course_file)
         for sheet in xls.sheet_names:
@@ -180,7 +166,6 @@ def extract_data_from_files(course_file, room_file):
             
             df = pd.read_excel(course_file, sheet_name=sheet, header=None)
             
-            # หาเส้นแบ่งเทอม
             split_idx = len(df.columns) // 2
             for r in range(min(15, len(df))):
                 row_txt = "".join([str(x) for x in df.iloc[r].values])
@@ -192,23 +177,20 @@ def extract_data_from_files(course_file, room_file):
 
             curr_year = 1
             for _, row in df.iterrows():
-                # ตรวจจับปี
                 row_str = " ".join([str(x) for x in row.values if str(x) != 'nan']).strip()
                 if len(row_str) < 100 and "หน่วยกิต" not in row_str:
                     ym = re.search(r'ปี.*?(\d)', row_str)
                     if ym and 1 <= int(ym.group(1)) <= 4: curr_year = int(ym.group(1))
 
-                # ฟังก์ชันย่อยแกะวิชา
                 def parse_segment(seg, semester):
                     res = []
                     matches = list(re.finditer(r'\b([A-Z]{2}\s?\d{3}\s?\d{3})\b', seg))
                     for i, m in enumerate(matches):
                         code = m.group(1).replace(" ", "")
-                        # Year Logic Check
                         y = curr_year
                         if len(code) >= 5 and code[4].isdigit():
                             dy = int(code[4])
-                            if dy > y and dy <= 4: y = dy # เชื่อรหัสวิชาถ้าปีมากกว่า
+                            if dy > y and dy <= 4: y = dy 
                         
                         start, end = m.end(), matches[i+1].start() if i+1 < len(matches) else len(seg)
                         sub = seg[start:end]
@@ -223,28 +205,21 @@ def extract_data_from_files(course_file, room_file):
                             meta = sub[cr.end():]
                             instrs = re.findall(r'\b[A-Z]{1,3}\d\b', meta)
                             if instrs: instr = ",".join(instrs)
-                            # หาจำนวนนศ. (ถ้ามี)
                             nums = [int(n) for n in re.findall(r'\b(\d{2,3})\b', meta) if 20 <= int(n) <= 200]
                             if nums: cnt = max(nums)
                         
                         name_clean = re.sub(r'\(.*?\)', '', name_raw).strip()
                         if len(name_clean) > 2:
-                            # *** สร้าง 2 ใบ (Reg/Sp) แยกกัน ***
-                            # ถ้าเจอจำนวน นศ. ให้ assume ว่าเป็นของภาคปกติ ส่วนภาคพิเศษลดลงหน่อย
-                            # หรือถ้าในอนาคตไฟล์มีแยกคอลัมน์ชัดเจนค่อยแก้ตรงนี้
-                            
-                            # 1. ภาคปกติ
+                            # สร้าง 2 ใบ (Reg / Sp) แยกกันชัดเจน
                             res.append(Course({
                                 'major': major, 'program': 'Reg', 'year': y, 'semester': semester,
                                 'code': code, 'name': name_clean, 'lec_hours': lec, 'lab_hours': lab,
                                 'student_count': cnt if cnt > 0 else 50, 'instructor': instr
                             }))
-                            
-                            # 2. ภาคพิเศษ (สร้างด้วย เพื่อให้จัดแยกกัน)
                             res.append(Course({
                                 'major': major, 'program': 'Sp', 'year': y, 'semester': semester,
                                 'code': code, 'name': name_clean, 'lec_hours': lec, 'lab_hours': lab,
-                                'student_count': 30, # สมมติภาคพิเศษคนน้อยกว่า
+                                'student_count': 30, 
                                 'instructor': instr
                             }))
                     return res
@@ -255,7 +230,7 @@ def extract_data_from_files(course_file, room_file):
                 all_courses.extend(parse_segment(s2, 2))
     except Exception as e: st.error(f"Course Read Error: {e}")
 
-    # --- 2. อ่านไฟล์ห้อง ---
+    # 2. Room File
     rooms, busy = [], []
     try:
         xls = pd.ExcelFile(room_file)
@@ -293,11 +268,9 @@ def generate_excel_report(sched1, sched2):
     output = io.BytesIO()
     writer = pd.ExcelWriter(output, engine='openpyxl')
     
-    # Collect Majors/Years from assignments
     all_scheds = [sched1, sched2]
     majors = set()
     years = set()
-    
     for s in all_scheds:
         for c in s.assignment:
             majors.add(c.major)
@@ -307,19 +280,16 @@ def generate_excel_report(sched1, sched2):
     
     for major in sorted(list(majors)):
         for year in sorted(list(years)):
-            for program in ['Reg', 'Sp']: # Loop แยกภาค
-                
+            for program in ['Reg', 'Sp']:
                 prog_name = 'ภาคปกติ' if program == 'Reg' else 'โครงการพิเศษ'
                 sheet_name = f"{major}-{year}-{program}"
                 
-                # Filter Courses
                 def get_data(sched):
                     return [
                         (c, d, t, r) for c, (d, t, r) in sched.assignment.items()
                         if c.major == major and c.year == year and c.program == program
                     ]
 
-                # Draw Grid
                 def draw_term(data, start_row):
                     df = pd.DataFrame('', index=Config.DAYS, columns=[f"{h}:00-{h+1}:00" for h in Config.TIME_SLOTS])
                     colors = {}
@@ -341,7 +311,6 @@ def generate_excel_report(sched1, sched2):
                 df1.to_excel(writer, sheet_name=sheet_name, startrow=3)
                 df2.to_excel(writer, sheet_name=sheet_name, startrow=14)
                 
-                # Styling
                 ws = writer.sheets[sheet_name]
                 for r, txt in [(1, "ภาคต้น"), (13, "ภาคปลาย")]:
                     ws[f'A{r}'] = f"ตารางเรียน {Config.MAJOR_MAP.get(major, major)} ปี {year} ({prog_name}) - {txt}"
@@ -360,11 +329,10 @@ def generate_excel_report(sched1, sched2):
                             if (r, c) in cmap: cell.fill = PatternFill(start_color=cmap[(r, c)], end_color=cmap[(r, c)], fill_type='solid')
                             elif r == start or c == 1: cell.fill = PatternFill(start_color="EEEEEE", end_color="EEEEEE", fill_type='solid'); cell.font = Font(bold=True)
 
-                # Failed List
                 failed = [c for s in all_scheds for c in s.failed_courses if c.major == major and c.year == year and c.program == program]
                 if failed:
                     ws.cell(row=24, column=1, value="⚠️ วิชาที่ลงไม่ได้:").font = Font(color="FF0000", bold=True)
-                    for i, f in enumerate(set(failed)): # set to dedup
+                    for i, f in enumerate(set(failed)): 
                         ws.cell(row=25+i, column=1, value=f"{f.code} {f.name}")
 
     writer.close()
@@ -391,7 +359,7 @@ if f_course and f_room:
                 else:
                     scheds = {}
                     for t in [1, 2]:
-                        # กรองวิชาตามเทอม
+                        # Filter by semester AND convert to list
                         term_courses = [c for c in courses if c.semester == t]
                         s = UniversityScheduler(term_courses, rooms, busy)
                         s.solve()
