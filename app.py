@@ -58,7 +58,7 @@ class Course:
         self.students = max(self.students, other_course.students)
 
 # ==========================================
-# 🧠 SCHEDULER ENGINE
+# 🧠 SCHEDULER ENGINE (แก้ไข Bug นักศึกษาแยกร่าง)
 # ==========================================
 class UniversityScheduler:
     def __init__(self, courses_df, rooms_df, busy_df):
@@ -98,28 +98,44 @@ class UniversityScheduler:
     def is_valid(self, course, day, start_time, room, squeeze_factor=1.25, strict_type=True, allow_lunch=False):
         end_time = start_time + course.duration
         
+        # 1. เช็คเวลา (Time Limit & Lunch)
         if end_time > 20: return False
-        if not allow_lunch:
-            if any(t == 12 for t in range(start_time, end_time)): return False
+        if not allow_lunch and any(t == 12 for t in range(start_time, end_time)): return False
 
+        # 2. เช็คความจุ (Capacity)
         if (room['capacity'] * squeeze_factor) < course.students: return False
 
+        # 3. เช็คประเภทห้อง (Room Type)
         if strict_type:
             if (course.type == 'Lab' and room['type'] != 'Lab') or (course.type == 'Lec' and room['type'] == 'Lab'): return False
 
+        # 4. เช็คห้องไม่ว่าง (Busy Slots)
         for t in range(start_time, end_time):
             if (str(room['room_name']), day, t) in self.busy_slots: return False
             
+        # 5. เช็คการชนกันกับวิชาที่ลงไปแล้ว (Conflicts)
         for assigned_c, (a_day, a_time, a_room) in self.assignment.items():
             if a_day == day:
                 a_end = a_time + assigned_c.duration
+                # ถ้าเวลาซ้อนทับกัน
                 if max(start_time, a_time) < min(end_time, a_end):
+                    
+                    # A. ห้องชน (Room Conflict)
                     if a_room == room['room_name']: return False 
+                    
+                    # B. อาจารย์ชน (Instructor Conflict)
                     inst_a = set(course.instructor.split(','))
                     inst_b = set(assigned_c.instructor.split(','))
                     if 'TBA' not in inst_a and 'TBA' not in inst_b:
                         if not inst_a.isdisjoint(inst_b): return False
 
+                    # C. นักศึกษาชน (Student Conflict) *** เพิ่มใหม่ ***
+                    # ถ้าสาขาเดียวกัน และ ชั้นปีเดียวกัน -> ห้ามเรียนเวลาเดียวกัน
+                    if not course.majors.isdisjoint(assigned_c.majors):
+                        if course.year == assigned_c.year:
+                            return False
+
+        # 6. เช็คลำดับ Lec < Lab
         if course.type == 'Lab' and course.related_course:
             lec = course.related_course
             if lec not in self.assignment: return False
@@ -271,9 +287,7 @@ def generate_excel_report(sched1, sched2):
     for s in [sched1, sched2]:
         for c in s.assignment: majors.add(list(c.majors)[0]); years.add(c.year)
     
-    # ------------------ แก้ไขตรงนี้ (เปลี่ยน thin_border เป็น thin) ------------------
     thin = Border(left=Side('thin'), right=Side('thin'), top=Side('thin'), bottom=Side('thin'))
-    # -------------------------------------------------------------------------
     
     for major in sorted(list(majors)):
         for year in sorted(list(years)):
@@ -317,7 +331,7 @@ def generate_excel_report(sched1, sched2):
                 for r_start, r_end, c_map in [(4, 11, col1), (15, 22, col2)]:
                     for row in ws.iter_rows(min_row=r_start, max_row=r_end, min_col=1, max_col=13):
                         for cell in row:
-                            cell.border = thin # ใช้ตัวแปร thin ที่ถูกต้องแล้ว
+                            cell.border = thin
                             cell.alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
                             if (cell.row, cell.column) in c_map:
                                 c = c_map[(cell.row, cell.column)]
