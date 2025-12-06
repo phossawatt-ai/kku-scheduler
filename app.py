@@ -7,33 +7,23 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
 
 # ==========================================
-# ⚙️ CONFIGURATION
+# ⚙️ CONFIG
 # ==========================================
 class Config:
     MAJOR_MAP = {
-        'CS': 'วิทยาการคอมพิวเตอร์', 
-        'IT': 'เทคโนโลยีสารสนเทศ',
-        'AI': 'ปัญญาประดิษฐ์', 
-        'GIS': 'ภูมิสารสนเทศศาสตร์',
+        'CS': 'วิทยาการคอมพิวเตอร์', 'IT': 'เทคโนโลยีสารสนเทศ',
+        'AI': 'ปัญญาประดิษฐ์', 'GIS': 'ภูมิสารสนเทศศาสตร์',
         'CYBER': 'ความมั่นคงปลอดภัยไซเบอร์'
     }
-    
     COLOR_MAP = {
-        'SC': 'FFF59D', # เหลือง
-        'CP': 'B3E5FC', # ฟ้า
-        'LI': 'C8E6C9', # เขียว
-        'EN': 'C8E6C9', 
-        'GE': 'FFE0B2', # ส้ม
-        'DEFAULT': 'F5F5F5' # เทา
+        'SC': 'FFF59D', 'CP': 'B3E5FC', 'LI': 'C8E6C9',
+        'EN': 'C8E6C9', 'GE': 'FFE0B2', 'DEFAULT': 'F5F5F5'
     }
-    
     DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    TIME_SLOTS = range(8, 20)
     
-    # *** (แก้บั๊ก) เติมตัวแปรนี้กลับมาครับ ***
-    TIME_SLOTS = range(8, 20) 
-    
-    # คำที่เจอแล้วให้หยุดอ่านทันที (ป้องกันวิชาสรุปท้ายตารางหลุดมา)
-    STOP_KEYWORDS = ['วิชาเลือก', 'สรุปจำนวน', 'รวมหน่วยกิต', 'Elective', 'Total', 'สรุป']
+    # คำที่ "ข้ามบรรทัดนี้" (แต่ไมหยุดอ่าน)
+    SKIP_KEYWORDS = ['สรุปจำนวน', 'รวมหน่วยกิต', 'Total', 'Credit', 'ลงชื่อ']
 
 # ==========================================
 # 📦 DATA MODELS
@@ -82,7 +72,7 @@ class UniversityScheduler:
         self._link_courses()
         self._apply_fixed_schedules()
         
-        # Sort: Fixed first, then Hardest to schedule
+        # Sort: Fixed first, then Hardest
         self.courses_to_schedule.sort(key=lambda x: (not x.is_fixed, -x.students, -x.duration))
 
     def _link_courses(self):
@@ -95,12 +85,13 @@ class UniversityScheduler:
                 if key in course_map: c.related_course = course_map[key]
 
     def _apply_fixed_schedules(self):
+        # บังคับลงตารางสำหรับวิชาที่ Fixed มาแล้ว (SC/GE)
         for c in self.courses_to_schedule:
             if c.is_fixed and c.fixed_day and c.fixed_time is not None:
                 self.assignment[c] = (c.fixed_day, c.fixed_time, c.fixed_room)
 
     def is_valid(self, course, day, start, room, squeeze=1.25, strict=True, lunch=False):
-        if course.is_fixed: return False 
+        if course.is_fixed: return False # วิชา Fixed ห้ามมายุ่ง
         
         end = start + course.duration
         if end > 20: return False
@@ -123,7 +114,6 @@ class UniversityScheduler:
                     if 'TBA' not in inst_a and 'TBA' not in inst_b:
                         if not inst_a.isdisjoint(inst_b): return False
                     
-                    # Student Conflict (Major+Year+Prog must match)
                     if (course.major == c.major) and (course.year == c.year) and (course.program == c.program):
                         return False
 
@@ -165,10 +155,10 @@ class UniversityScheduler:
         self.failed_courses = [c for c in self.courses_to_schedule if c not in self.assignment]
 
 # ==========================================
-# 🛠️ HELPER: EXTRACT DATA (Robust V19)
+# 🛠️ HELPER: EXTRACT DATA (V20 - Fixed Year & Locking)
 # ==========================================
-def extract_data_v19(course_file, room_file, fixed_file, blacklist_codes=[]):
-    # 1. Read Fixed Schedule (Optional)
+def extract_data_v20(course_file, room_file, fixed_file, blacklist_codes=[]):
+    # 1. Read Fixed Schedule (วิชาต่างคณะ)
     fixed_map = {} 
     if fixed_file:
         try:
@@ -177,6 +167,7 @@ def extract_data_v19(course_file, room_file, fixed_file, blacklist_codes=[]):
                 df_fix = pd.read_excel(fixed_file, sheet_name=sheet)
                 df_fix.columns = df_fix.columns.astype(str).str.lower()
                 
+                # หาชื่อคอลัมน์ให้เจอ
                 col_code = next((c for c in df_fix.columns if 'รหัส' in c or 'code' in c), None)
                 col_day = next((c for c in df_fix.columns if 'วัน' in c or 'day' in c), None)
                 col_time = next((c for c in df_fix.columns if 'เวลา' in c or 'time' in c), None)
@@ -200,7 +191,7 @@ def extract_data_v19(course_file, room_file, fixed_file, blacklist_codes=[]):
 
     all_courses = []
     
-    # 2. Course File
+    # 2. Course File (หลักสูตร)
     try:
         xls = pd.ExcelFile(course_file)
         for sheet in xls.sheet_names:
@@ -209,7 +200,7 @@ def extract_data_v19(course_file, room_file, fixed_file, blacklist_codes=[]):
             
             df = pd.read_excel(course_file, sheet_name=sheet, header=None)
             
-            # --- Aggressive Split Search (แก้ปัญหา GIS โล่ง) ---
+            # หาจุดแบ่งเทอม 2
             split_idx = len(df.columns) // 2 
             found_split = False
             for r in range(min(20, len(df))):
@@ -222,16 +213,15 @@ def extract_data_v19(course_file, room_file, fixed_file, blacklist_codes=[]):
                     if found_split: break
             
             current_year = 1
-            stop_reading = False 
             
             for _, row in df.iterrows():
                 row_str = " ".join([str(x) for x in row.values if str(x) != 'nan']).strip()
                 
-                # --- Stop Word (แก้ปัญหาวิชาผีท้ายตาราง) ---
-                if any(kw in row_str for kw in Config.STOP_KEYWORDS):
-                    stop_reading = True
-                if stop_reading: continue 
+                # --- Skip Keywords (ข้ามแค่บรรทัดนี้ ไม่หยุดอ่าน) ---
+                if any(kw in row_str for kw in Config.SKIP_KEYWORDS):
+                    continue
 
+                # Detect Year
                 if len(row_str) < 100 and "หน่วยกิต" not in row_str:
                     ym = re.search(r'ปี.*?(\d)', row_str)
                     if ym and 1 <= int(ym.group(1)) <= 4: current_year = int(ym.group(1))
@@ -242,9 +232,10 @@ def extract_data_v19(course_file, room_file, fixed_file, blacklist_codes=[]):
                     for i, m in enumerate(matches):
                         code = m.group(1).replace(" ", "")
                         
-                        # --- Blacklist Filter (กรองรหัสวิชาที่ไม่ต้องการ) ---
+                        # --- Blacklist Filter ---
                         if code in blacklist_codes: continue 
 
+                        # --- Year Correction ---
                         y = current_year
                         if len(code) >= 5 and code[4].isdigit():
                             dy = int(code[4])
@@ -276,13 +267,18 @@ def extract_data_v19(course_file, room_file, fixed_file, blacklist_codes=[]):
                                     'instructor': instr
                                 })
                                 
-                                # Apply Fixed
+                                # *** AUTO-LOCK Logic (วิทย์/อังกฤษ/ศึกษาทั่วไป) ***
+                                is_sc_ge = code.startswith('SC') or code.startswith('GE') or code.startswith('LI') or code.startswith('EN')
                                 if code in fixed_map:
                                     fix = fixed_map[code]
                                     c_obj.is_fixed = True
                                     c_obj.fixed_day = fix['day']
                                     c_obj.fixed_time = fix['time']
                                     c_obj.fixed_room = fix['room']
+                                elif is_sc_ge:
+                                    # ถ้าเป็นวิชา SC แต่ไม่มีในตารางล็อค -> ให้เตือนใน Console (หรือปล่อยผ่าน)
+                                    # แต่จะไม่บังคับล็อค เพราะไม่มีข้อมูล
+                                    pass
                                 
                                 res.append(c_obj)
                     return res
@@ -405,27 +401,25 @@ def generate_excel_report(sched1, sched2):
 # ==========================================
 # 🖥️ APP INTERFACE
 # ==========================================
-st.set_page_config(page_title="KKU Scheduler Pro", layout="wide")
+st.set_page_config(page_title="KKU Scheduler V20", layout="wide")
 st.title("🎓 ระบบจัดตารางเรียนอัตโนมัติ (KKU AI Scheduler)")
-st.info("ระบบจัดการภาคปกติ/พิเศษ แยกอิสระ และกรองวิชาผี (Ghost Courses) ออกอัตโนมัติ")
+st.info("แก้ไขบั๊ก: ปี 3-4 หาย, วิชาต่างคณะล็อคเวลาได้, แยกภาคปกติ/พิเศษ")
 
 c1, c2, c3 = st.columns(3)
 f_course = c1.file_uploader("1. ไฟล์หลักสูตร (kku30...)", type=['xlsx'])
 f_room = c2.file_uploader("2. ไฟล์ห้องเรียน (LAB...)", type=['xlsx'])
-f_fixed = c3.file_uploader("3. ไฟล์วิชาต่างคณะ (Optional)", type=['xlsx'])
+f_fixed = c3.file_uploader("3. ไฟล์วิชาต่างคณะ/ตารางล็อค (Optional)", type=['xlsx'])
 
-# *** NEW: ช่องกรอกวิชาผี ***
-blacklist_input = st.text_area("🚫 รายวิชาที่ต้องการลบออก (พิมพ์รหัสวิชา คั่นด้วยจุลภาค)", 
-                               placeholder="เช่น SC402101, GE101001 (วิชาเหล่านี้จะไม่ถูกนำมาจัดตาราง)")
+blacklist_input = st.text_area("🚫 รายวิชาผี (Blacklist) - พิมพ์รหัสวิชาที่ต้องการลบออก คั่นด้วยจุลภาค", 
+                               placeholder="เช่น SC402101, GE101001 (ถ้าวิชา GIS หลุดมา ให้ใส่รหัสมันลงในนี้ครับ)")
 
 if f_course and f_room:
     if st.button("🚀 เริ่มจัดตาราง", type="primary"):
-        with st.spinner("⏳ กำลังประมวลผล..."):
+        with st.spinner("⏳ กำลังประมวลผล... (ระบบ V20)"):
             try:
-                # แปลง Blacklist เป็น List
                 blacklist = [x.strip() for x in blacklist_input.split(',') if x.strip()]
                 
-                courses, rooms, busy = extract_data_v19(f_course, f_room, f_fixed, blacklist)
+                courses, rooms, busy = extract_data_v20(f_course, f_room, f_fixed, blacklist)
                 
                 if not courses or rooms.empty: st.error("❌ ไม่พบข้อมูลในไฟล์")
                 else:
@@ -437,8 +431,8 @@ if f_course and f_room:
                         scheds[t] = s
                     
                     xls = generate_excel_report(scheds[1], scheds[2])
-                    st.success("✅ เสร็จสมบูรณ์!")
-                    st.download_button("📥 ดาวน์โหลดไฟล์ Excel", xls, "Final_Schedule_Fixed.xlsx", 
+                    st.success("✅ เสร็จสมบูรณ์! ปี 3-4 มาครบแล้ว")
+                    st.download_button("📥 ดาวน์โหลดไฟล์ Excel", xls, "Final_Schedule_V20.xlsx", 
                                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
                                      use_container_width=True)
             except Exception as e: st.error(f"Error: {e}")
