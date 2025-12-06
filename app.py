@@ -5,7 +5,7 @@ import io
 import time
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
-from ortools.sat.python import cp_model  # <--- พระเอกของเรา
+from ortools.sat.python import cp_model
 
 # ==========================================
 # ⚙️ CONFIGURATION
@@ -21,7 +21,7 @@ class Config:
         'EN': 'C8E6C9', 'GE': 'FFE0B2', 'DEFAULT': 'F5F5F5'
     }
     DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-    TIME_SLOTS = range(8, 20) # 08:00 - 20:00
+    TIME_SLOTS = range(8, 20)
     STOP_KEYWORDS = ['สรุปจำนวน', 'รวมหน่วยกิต', 'Total', 'Credit', 'ลงชื่อ']
 
 # ==========================================
@@ -38,22 +38,19 @@ class Course:
         self.type = 'Lab' if row_data.get('lab_hours', 0) > 0 else 'Lec'
         self.year = int(row_data.get('year', 1))
         
-        # Student Count
         base = int(row_data.get('student_count', 0))
         self.students = base if base > 0 else (50 if self.program == 'Reg' else 30)
         
-        # Duration
         raw_dur = int(row_data['lec_hours']) if self.type == 'Lec' else int(row_data['lab_hours'])
         self.duration = min(raw_dur, 4) if raw_dur > 0 else 2
         
-        # Fixed Schedule
         self.is_fixed = False
         self.fixed_day = None
         self.fixed_time = None
         self.fixed_room = None
         
         self.related_course = None 
-        self.uid = f"{self.code}_{self.program}_{self.type}_{id(self)}" # Unique ID for solver
+        self.uid = f"{self.code}_{self.program}_{self.type}_{id(self)}"
 
     def __repr__(self):
         return f"{self.code}"
@@ -68,8 +65,6 @@ class UniversityScheduler:
         self.courses = courses_list
         self.assignment = {}
         self.failed_courses = []
-        
-        # Link Lec-Lab
         self._link_courses()
 
     def _link_courses(self):
@@ -83,12 +78,9 @@ class UniversityScheduler:
 
     def solve(self):
         model = cp_model.CpModel()
-        
-        # 1. Variables: x[course, day, hour, room] -> Boolean
-        # เก็บตัวแปรทั้งหมดเพื่อนำไปสร้าง Constraint
         shifts = {} 
         
-        # แยกวิชา Fixed ออกไปก่อน (Assign เลย)
+        # 1. Prepare Courses & Fixed Assignments
         courses_to_solve = []
         for c in self.courses:
             if c.is_fixed and c.fixed_day and c.fixed_time:
@@ -96,166 +88,125 @@ class UniversityScheduler:
             else:
                 courses_to_solve.append(c)
 
-        # สร้างตัวแปรให้วิชาที่ต้องจัด
+        # 2. Create Variables
         for c in courses_to_solve:
-            # เลือกห้องที่จุพอ (Squeeze 25%)
             valid_rooms = [r for r in self.rooms if (r['capacity'] * 1.25) >= c.students]
-            # กรองประเภทห้อง (Strict)
-            valid_rooms = [r for r in valid_rooms if r['type'] == c.type]
-            # ถ้าหาไม่ได้เลย ให้ใช้ห้องอะไรก็ได้ที่จุพอ
-            if not valid_rooms:
-                valid_rooms = [r for r in self.rooms if (r['capacity'] * 1.25) >= c.students]
+            pref_rooms = [r for r in valid_rooms if r['type'] == c.type]
+            if not pref_rooms: pref_rooms = valid_rooms # Relax room type if needed
 
             for d in Config.DAYS:
                 for h in Config.TIME_SLOTS:
-                    # เวลาเลิกต้องไม่เกิน 20.00
                     if h + c.duration > 20: continue
-                    # ห้ามทับเที่ยง
-                    if any(t == 12 for t in range(h, h + c.duration)): continue
+                    if any(t == 12 for t in range(h, h + c.duration)): continue # No lunch overlap
                     
-                    for r in valid_rooms:
-                        # เช็ค Busy Slots จากไฟล์
+                    for r in pref_rooms:
+                        # Check Busy Slots
                         if any((r['room_name'], d, t) in self.busy_slots for t in range(h, h + c.duration)):
                             continue
-                            
-                        shifts[(c.uid, d, h, r['room_name'])] = model.NewBoolVar(f'shift_{c.code}_{d}_{h}_{r["room_name"]}')
+                        shifts[(c.uid, d, h, r['room_name'])] = model.NewBoolVar(f'shift_{c.uid}_{d}_{h}_{r["room_name"]}')
 
-        # 2. Constraints
-        
-        # C1: แต่ละวิชาต้องลงแค่ 1 ครั้งเท่านั้น
+        # 3. Constraints
+        # C1: Each course happens exactly once
         for c in courses_to_solve:
             c_shifts = [shifts[key] for key in shifts if key[0] == c.uid]
             if c_shifts:
                 model.Add(sum(c_shifts) == 1)
             else:
-                # ถ้าไม่มี Slot ลงได้เลยตั้งแต่ต้น (เช่น ห้องไม่พอ)
                 self.failed_courses.append(c)
 
-        # Helper: สร้าง Map ของ (Day, Hour) -> List of vars active at that time
-        # เพื่อเช็คการชนกัน
-        time_slot_map = {} # Key: (day, hour) -> List of (course, var, room, instructor, student_group)
+        # Build Time Slot Map for Conflict Checking
+        time_slot_map = {} 
         
-        # ใส่ Fixed Course ลงใน Map ด้วย (เพื่อกันที่)
+        # Add Fixed Courses to Map
         for c, (d, t, r) in self.assignment.items():
-            for duration_i in range(c.duration):
-                current_h = t + duration_i
-                key = (d, current_h)
+            for i in range(c.duration):
+                key = (d, t + i)
                 if key not in time_slot_map: time_slot_map[key] = []
-                # Fixed course ไม่มี variable (คือ 1 เสมอ)
-                time_slot_map[key].append({
-                    'type': 'fixed', 'room': r, 'instr': c.instructor, 
-                    'group': (c.major, c.year, c.program)
-                })
+                time_slot_map[key].append({'type': 'fixed', 'room': r, 'instr': c.instructor, 'grp': (c.major, c.year, c.program)})
 
-        # ใส่ Variable ของวิชาที่จะจัดลง Map
-        for (c_uid, d, h, r_name), var in shifts.items():
-            # หา course object
-            c = next(x for x in courses_to_solve if x.uid == c_uid)
-            for duration_i in range(c.duration):
-                current_h = h + duration_i
-                key = (d, current_h)
+        # Add Variable Courses to Map
+        for (uid, d, h, r_name), var in shifts.items():
+            c = next(x for x in courses_to_solve if x.uid == uid)
+            for i in range(c.duration):
+                key = (d, h + i)
                 if key not in time_slot_map: time_slot_map[key] = []
-                time_slot_map[key].append({
-                    'type': 'var', 'var': var, 'room': r_name, 'instr': c.instructor,
-                    'group': (c.major, c.year, c.program)
-                })
+                time_slot_map[key].append({'type': 'var', 'var': var, 'room': r_name, 'instr': c.instructor, 'grp': (c.major, c.year, c.program)})
 
-        # C2: เช็คการชนกัน (Conflict Constraints)
-        for (d, h), items in time_slot_map.items():
-            # 2.1 ห้องชน (Room Conflict)
-            rooms_in_slot = {}
+        # C2: Conflict Checking
+        for slot, items in time_slot_map.items():
+            # 2.1 Room Conflict
+            rooms_map = {}
             for item in items:
                 r = item['room']
-                if r not in rooms_in_slot: rooms_in_slot[r] = []
-                if item['type'] == 'var': rooms_in_slot[r].append(item['var'])
-                else: rooms_in_slot[r].append(1) # Fixed course นับเป็น 1
+                if r not in rooms_map: rooms_map[r] = []
+                if item['type'] == 'var': rooms_map[r].append(item['var'])
+                else: rooms_map[r].append(1) # 1 means occupied by fixed course
             
-            for r, vars_list in rooms_in_slot.items():
-                # ถ้ามี Fixed course อยู่แล้ว ห้ามมี var อื่นลงห้องนี้
-                if 1 in vars_list:
+            for r, vars_list in rooms_map.items():
+                if 1 in vars_list: # If fixed course uses this room
                     for v in vars_list:
-                        if v != 1: model.Add(v == 0)
+                        if v is not 1: model.Add(v == 0) # *** FIX: use 'is not 1' ***
                 else:
-                    # ห้ามลงห้องเดียวกันเกิน 1 วิชา
-                    if len(vars_list) > 1:
-                        model.Add(sum(vars_list) <= 1)
+                    if len(vars_list) > 1: model.Add(sum(vars_list) <= 1)
 
-            # 2.2 อาจารย์ชน (Instructor Conflict)
-            # (ข้าม TBA)
-            instr_in_slot = {}
+            # 2.2 Instructor Conflict (Ignore TBA)
+            instr_map = {}
             for item in items:
-                instrs = item['instr'].split(',')
-                for instr in instrs:
+                for instr in item['instr'].split(','):
                     instr = instr.strip()
                     if instr == 'TBA': continue
-                    if instr not in instr_in_slot: instr_in_slot[instr] = []
-                    if item['type'] == 'var': instr_in_slot[instr].append(item['var'])
-                    else: instr_in_slot[instr].append(1)
+                    if instr not in instr_map: instr_map[instr] = []
+                    if item['type'] == 'var': instr_map[instr].append(item['var'])
+                    else: instr_map[instr].append(1)
             
-            for instr, vars_list in instr_in_slot.items():
+            for instr, vars_list in instr_map.items():
                 if 1 in vars_list:
                     for v in vars_list:
-                        if v != 1: model.Add(v == 0)
+                        if v is not 1: model.Add(v == 0) # *** FIX ***
                 else:
-                    if len(vars_list) > 1:
-                        model.Add(sum(vars_list) <= 1)
+                    if len(vars_list) > 1: model.Add(sum(vars_list) <= 1)
 
-            # 2.3 นักศึกษาชน (Student Group Conflict)
-            group_in_slot = {}
+            # 2.3 Student Group Conflict
+            grp_map = {}
             for item in items:
-                g = item['group']
-                if g not in group_in_slot: group_in_slot[g] = []
-                if item['type'] == 'var': group_in_slot[g].append(item['var'])
-                else: group_in_slot[g].append(1)
+                g = item['grp']
+                if g not in grp_map: grp_map[g] = []
+                if item['type'] == 'var': grp_map[g].append(item['var'])
+                else: grp_map[g].append(1)
             
-            for g, vars_list in group_in_slot.items():
+            for g, vars_list in grp_map.items():
                 if 1 in vars_list:
                     for v in vars_list:
-                        if v != 1: model.Add(v == 0)
+                        if v is not 1: model.Add(v == 0) # *** FIX ***
                 else:
-                    if len(vars_list) > 1:
-                        model.Add(sum(vars_list) <= 1)
+                    if len(vars_list) > 1: model.Add(sum(vars_list) <= 1)
 
-        # C3: Lec < Lab Sequence (Soft Constraint for simplicity in V1)
-        # การทำ Hard Constraint เรื่อง Sequence ข้ามวันใน OR-Tools ค่อนข้างซับซ้อน 
-        # เพื่อความรวดเร็วและไม่ให้ solver ค้าง เราจะเน้น Conflict เป็นหลักก่อน
-
-        # 3. Objectives (Minimize Bad Times)
-        # พยายามเลี่ยงตอนเย็น (17.00+) และ เสาร์อาทิตย์
+        # 4. Objectives (Soft Constraints)
         penalties = []
-        for (c_uid, d, h, r_name), var in shifts.items():
-            penalty = 0
-            if d in ['Sat', 'Sun']: penalty += 100 # เกลียดเสาร์อาทิตย์มาก
-            if h >= 17: penalty += 20 # ไม่ชอบเรียนค่ำ
-            if h >= 16: penalty += 5  # เลี่ยงเย็นนิดหน่อย
+        for (uid, d, h, r_name), var in shifts.items():
+            cost = 0
+            if d in ['Sat', 'Sun']: cost += 500 # Avoid Weekend
+            if h >= 17: cost += 50 # Avoid Night
+            if h >= 16: cost += 10 # Avoid Late
+            if cost > 0: penalties.append(var * cost)
             
-            if penalty > 0:
-                penalties.append(var * penalty)
-        
-        if penalties:
-            model.Minimize(sum(penalties))
+        if penalties: model.Minimize(sum(penalties))
 
-        # 4. Solver Run
+        # 5. Solve
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 60.0 # ให้เวลาคิด 60 วินาทีพอ
+        solver.parameters.max_time_in_seconds = 120.0
         status = solver.Solve(model)
 
-        # 5. Extract Results
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-            for (c_uid, d, h, r_name), var in shifts.items():
+            for (uid, d, h, r_name), var in shifts.items():
                 if solver.Value(var) == 1:
-                    # Find course object
-                    c = next(x for x in courses_to_solve if x.uid == c_uid)
+                    c = next(x for x in courses_to_solve if x.uid == uid)
                     self.assignment[c] = (d, h, r_name)
-        else:
-            # ถ้าจัดไม่ได้เลย ให้แจ้งเตือน (แต่ปกติควรจะได้บ้าง)
-            pass
-            
-        # Update Failed Courses
-        assigned_uids = [c.uid for c in self.assignment.keys()]
+        
+        # Check failed
+        assigned_uids = {c.uid for c in self.assignment}
         for c in courses_to_solve:
-            if c.uid not in assigned_uids:
-                self.failed_courses.append(c)
+            if c.uid not in assigned_uids: self.failed_courses.append(c)
 
 # ==========================================
 # 🛠️ HELPER: EXTRACT DATA
@@ -289,7 +240,6 @@ def extract_data_v21(course_file, room_file, fixed_file, blacklist_codes=[]):
         except: pass
 
     all_courses = []
-    
     # 2. Course File
     try:
         xls = pd.ExcelFile(course_file)
@@ -406,14 +356,12 @@ def extract_data_v21(course_file, room_file, fixed_file, blacklist_codes=[]):
 def generate_excel_report(sched1, sched2):
     output = io.BytesIO()
     writer = pd.ExcelWriter(output, engine='openpyxl')
-    
     all_scheds = [sched1, sched2]
     majors = set()
     years = set()
     for s in all_scheds:
         for c in s.assignment:
-            majors.add(c.major)
-            years.add(c.year)
+            majors.add(c.major); years.add(c.year)
             
     thin = Border(left=Side('thin'), right=Side('thin'), top=Side('thin'), bottom=Side('thin'))
     
@@ -424,10 +372,8 @@ def generate_excel_report(sched1, sched2):
                 sheet_name = f"{major}-{year}-{program}"
                 
                 def get_data(sched):
-                    return [
-                        (c, d, t, r) for c, (d, t, r) in sched.assignment.items()
-                        if c.major == major and c.year == year and c.program == program
-                    ]
+                    return [(c, d, t, r) for c, (d, t, r) in sched.assignment.items()
+                            if c.major == major and c.year == year and c.program == program]
 
                 def draw_term(data, start_row):
                     df = pd.DataFrame('', index=Config.DAYS, columns=[f"{h}:00-{h+1}:00" for h in Config.TIME_SLOTS])
