@@ -7,7 +7,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
 
 # ==========================================
-# ⚙️ CONFIGURATION
+# ⚙️ CONFIG
 # ==========================================
 class Config:
     MAJOR_MAP = {
@@ -20,7 +20,8 @@ class Config:
         'EN': 'C8E6C9', 'GE': 'FFE0B2', 'DEFAULT': 'F5F5F5'
     }
     DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-    TIME_SLOTS = range(8, 20)
+    # คำที่เจอแล้วให้หยุดอ่านทันที (ป้องกันวิชาผีท้ายตาราง)
+    STOP_KEYWORDS = ['วิชาเลือก', 'สรุปจำนวน', 'รวมหน่วยกิต', 'Elective', 'Total']
 
 # ==========================================
 # 📦 DATA MODELS
@@ -36,19 +37,12 @@ class Course:
         self.type = 'Lab' if row_data.get('lab_hours', 0) > 0 else 'Lec'
         self.year = int(row_data.get('year', 1))
         
-        # Student Count
+        # Student Count & Duration
         base = int(row_data.get('student_count', 0))
         self.students = base if base > 0 else (50 if self.program == 'Reg' else 30)
         
-        # Duration
         raw_dur = int(row_data['lec_hours']) if self.type == 'Lec' else int(row_data['lab_hours'])
         self.duration = min(raw_dur, 4) if raw_dur > 0 else 2
-        
-        # Status
-        self.is_fixed = False
-        self.fixed_day = None
-        self.fixed_time = None
-        self.fixed_room = None
         
         self.related_course = None 
 
@@ -67,10 +61,8 @@ class UniversityScheduler:
         
         self.courses_to_schedule = courses_list
         self._link_courses()
-        self._apply_fixed_schedules() # <--- New Step
-        
-        # Sort: Fixed first, then Hardest to schedule
-        self.courses_to_schedule.sort(key=lambda x: (not x.is_fixed, -x.students, -x.duration))
+        # Sort: Hardest to schedule first
+        self.courses_to_schedule.sort(key=lambda x: (-x.students, -x.duration))
 
     def _link_courses(self):
         course_map = {}
@@ -81,18 +73,7 @@ class UniversityScheduler:
                 key = (c.major, c.program, c.code)
                 if key in course_map: c.related_course = course_map[key]
 
-    def _apply_fixed_schedules(self):
-        # ล็อควิชาที่มีข้อมูล Fixed มาแล้ว
-        for c in self.courses_to_schedule:
-            if c.is_fixed and c.fixed_day and c.fixed_time is not None:
-                # Assign เลย ไม่ต้องรอ solve
-                self.assignment[c] = (c.fixed_day, c.fixed_time, c.fixed_room)
-                # Mark busy
-                # (Optional: เราอาจจะไม่ Mark busy ห้องของวิชาต่างคณะ เพราะมันอยู่นอกตึกเรา)
-
     def is_valid(self, course, day, start, room, squeeze=1.25, strict=True, lunch=False):
-        if course.is_fixed: return False # วิชา Fixed ห้ามมายุ่งใน process ปกติ
-        
         end = start + course.duration
         if end > 20: return False
         if not lunch and any(t == 12 for t in range(start, end)): return False
@@ -115,7 +96,7 @@ class UniversityScheduler:
                     if 'TBA' not in inst_a and 'TBA' not in inst_b:
                         if not inst_a.isdisjoint(inst_b): return False
                     
-                    # Student Conflict (Major+Year+Prog)
+                    # Student Conflict (Major+Year+Prog must match)
                     if (course.major == c.major) and (course.year == c.year) and (course.program == c.program):
                         return False
 
@@ -139,7 +120,6 @@ class UniversityScheduler:
         ]
         
         for phase in phases:
-            # เลือกเฉพาะวิชาที่ยังไม่ได้ Assign (Fixed courses assign ไปแล้ว)
             remaining = [c for c in self.courses_to_schedule if c not in self.assignment]
             rooms_try = self.rooms if phase['strict'] else sorted(self.rooms, key=lambda x: x['capacity'], reverse=True)
             
@@ -158,49 +138,12 @@ class UniversityScheduler:
         self.failed_courses = [c for c in self.courses_to_schedule if c not in self.assignment]
 
 # ==========================================
-# 🛠️ HELPER: EXTRACT DATA
+# 🛠️ HELPER: EXTRACT DATA (Robust Version)
 # ==========================================
-def extract_data_v3(course_file, room_file, fixed_file):
-    # 1. Read Fixed Schedule (ถ้ามี)
-    fixed_map = {} # Key: CourseCode -> {day, time, room}
-    if fixed_file:
-        try:
-            # สมมติไฟล์วิชาต่างคณะเป็น Excel ตาราง
-            # พยายามหา Column: Code, Day, Time, Room
-            xls_fix = pd.ExcelFile(fixed_file)
-            for sheet in xls_fix.sheet_names:
-                df_fix = pd.read_excel(fixed_file, sheet_name=sheet)
-                # Clean headers
-                df_fix.columns = df_fix.columns.astype(str).str.lower()
-                
-                # หา column ที่น่าจะเป็น
-                col_code = next((c for c in df_fix.columns if 'รหัส' in c or 'code' in c), None)
-                col_day = next((c for c in df_fix.columns if 'วัน' in c or 'day' in c), None)
-                col_time = next((c for c in df_fix.columns if 'เวลา' in c or 'time' in c), None)
-                col_room = next((c for c in df_fix.columns if 'ห้อง' in c or 'room' in c), None)
-                
-                if col_code and col_day and col_time:
-                    for _, row in df_fix.iterrows():
-                        c_code = str(row[col_code]).replace(" ", "").strip()
-                        c_day = str(row[col_day]).strip()
-                        c_time = str(row[col_time]).strip()
-                        c_room = str(row[col_room]) if col_room else "External"
-                        
-                        # Convert Day TH -> EN
-                        d_map = {'จันทร์':'Mon', 'อังคาร':'Tue', 'พุธ':'Wed', 'พฤหัส':'Thu', 'ศุกร์':'Fri', 'เสาร์':'Sat', 'อาทิตย์':'Sun'}
-                        day_en = next((en for th, en in d_map.items() if th in c_day), None)
-                        
-                        # Convert Time -> Start Hour
-                        # ex: 8.30-11.30 -> 8
-                        time_match = re.search(r'(\d+)', c_time)
-                        start_h = int(time_match.group(1)) if time_match else None
-                        
-                        if day_en and start_h:
-                            fixed_map[c_code] = {'day': day_en, 'time': start_h, 'room': c_room}
-        except: pass
-
-    # 2. Extract Courses (with Fixed Logic)
+def extract_data_v18(course_file, room_file, blacklist_codes=[]):
     all_courses = []
+    
+    # 1. Course File
     try:
         xls = pd.ExcelFile(course_file)
         for sheet in xls.sheet_names:
@@ -208,27 +151,46 @@ def extract_data_v3(course_file, room_file, fixed_file):
             if not major: continue
             
             df = pd.read_excel(course_file, sheet_name=sheet, header=None)
-            split_idx = len(df.columns) // 2
-            for r in range(min(15, len(df))):
+            
+            # --- Fix GIS Empty: More aggressive split search ---
+            split_idx = len(df.columns) // 2 # Default Fallback
+            found_split = False
+            for r in range(min(20, len(df))): # Scan deeper (20 rows)
                 row_txt = "".join([str(x) for x in df.iloc[r].values])
-                if "ภาคปลาย" in row_txt or "การศึกษาที่ 2" in row_txt:
+                if "ภาคปลาย" in row_txt or "การศึกษาที่ 2" in row_txt or "Semester 2" in row_txt:
                     for c in range(len(df.columns)):
-                        if "ภาคปลาย" in str(df.iloc[r, c]) or "การศึกษาที่ 2" in str(df.iloc[r, c]): split_idx = c; break
-                    break
-
-            curr_year = 1
+                        val = str(df.iloc[r, c])
+                        if "ภาคปลาย" in val or "การศึกษาที่ 2" in val or "Semester 2" in val:
+                            split_idx = c; found_split = True; break
+                    if found_split: break
+            
+            current_year = 1
+            stop_reading = False # Flag to stop reading ghost courses
+            
             for _, row in df.iterrows():
                 row_str = " ".join([str(x) for x in row.values if str(x) != 'nan']).strip()
+                
+                # --- Stop Word Check ---
+                if any(kw in row_str for kw in Config.STOP_KEYWORDS):
+                    stop_reading = True
+                
+                if stop_reading: continue # Skip the rest of the sheet
+
+                # Detect Year
                 if len(row_str) < 100 and "หน่วยกิต" not in row_str:
                     ym = re.search(r'ปี.*?(\d)', row_str)
-                    if ym and 1 <= int(ym.group(1)) <= 4: curr_year = int(ym.group(1))
+                    if ym and 1 <= int(ym.group(1)) <= 4: current_year = int(ym.group(1))
 
                 def parse_segment(seg, semester):
                     res = []
                     matches = list(re.finditer(r'\b([A-Z]{2}\s?\d{3}\s?\d{3})\b', seg))
                     for i, m in enumerate(matches):
                         code = m.group(1).replace(" ", "")
-                        y = curr_year
+                        
+                        # --- Blacklist Filter ---
+                        if code in blacklist_codes: continue 
+
+                        y = current_year
                         if len(code) >= 5 and code[4].isdigit():
                             dy = int(code[4])
                             if dy > y and dy <= 4: y = dy 
@@ -239,6 +201,7 @@ def extract_data_v3(course_file, room_file, fixed_file):
                         lec, lab, cnt, instr = 3, 0, 0, "TBA"
                         cr = re.search(r'(\d+)\s*\(\s*(\d+)\s*-\s*(\d+)\s*-\s*(\d+)\s*\)', sub)
                         name_raw = sub
+                        
                         if cr:
                             name_raw = sub[:cr.start()]
                             lec, lab = int(cr.group(2)), int(cr.group(3))
@@ -250,31 +213,26 @@ def extract_data_v3(course_file, room_file, fixed_file):
                         
                         name_clean = re.sub(r'\(.*?\)', '', name_raw).strip()
                         if len(name_clean) > 2:
-                            for prog in ['Reg', 'Sp']:
-                                c_obj = Course({
-                                    'major': major, 'program': prog, 'year': y, 'semester': semester,
-                                    'code': code, 'name': name_clean, 'lec_hours': lec, 'lab_hours': lab,
-                                    'student_count': cnt if cnt > 0 else (50 if prog=='Reg' else 30), 'instructor': instr
-                                })
-                                
-                                # *** Check Fixed Schedule ***
-                                if code in fixed_map:
-                                    fix = fixed_map[code]
-                                    c_obj.is_fixed = True
-                                    c_obj.fixed_day = fix['day']
-                                    c_obj.fixed_time = fix['time']
-                                    c_obj.fixed_room = fix['room']
-                                
-                                res.append(c_obj)
+                            # Create Reg & Sp courses
+                            res.append(Course({
+                                'major': major, 'program': 'Reg', 'year': y, 'semester': semester,
+                                'code': code, 'name': name_clean, 'lec_hours': lec, 'lab_hours': lab,
+                                'student_count': cnt if cnt > 0 else 50, 'instructor': instr
+                            }))
+                            res.append(Course({
+                                'major': major, 'program': 'Sp', 'year': y, 'semester': semester,
+                                'code': code, 'name': name_clean, 'lec_hours': lec, 'lab_hours': lab,
+                                'student_count': 30, 'instructor': instr
+                            }))
                     return res
 
                 s1 = " ".join([str(x) for x in row.iloc[:split_idx].values if str(x) != 'nan'])
                 s2 = " ".join([str(x) for x in row.iloc[split_idx:].values if str(x) != 'nan'])
                 all_courses.extend(parse_segment(s1, 1))
                 all_courses.extend(parse_segment(s2, 2))
-    except: pass
+    except Exception as e: st.error(f"Course Read Error: {e}")
 
-    # 3. Read Rooms
+    # 2. Room File
     rooms, busy = [], []
     try:
         xls = pd.ExcelFile(room_file)
@@ -288,19 +246,20 @@ def extract_data_v3(course_file, room_file, fixed_file):
             else:
                 caps = [int(c) for c in re.findall(r'\((\d+)\)', head) if int(c) < 500]
                 if caps: cap = caps[0]
+            
             rooms.append({'room_name': sheet.strip(), 'type': 'Lab' if 'LAB' in sheet.upper() else 'Lec', 'capacity': cap})
             
             s_row = next((i for i, r in df.iterrows() if "จันทร์" in str(r.values)), -1)
             if s_row != -1:
                 sch = df.iloc[s_row:].reset_index(drop=True)
                 d_map = {'จันทร์': 'Mon', 'อังคาร': 'Tue', 'พุธ': 'Wed', 'พฤหัส': 'Thu', 'ศุกร์': 'Fri', 'เสาร์': 'Sat', 'อาทิตย์': 'Sun'}
-                for _, row in sch.iterrows():
+                for r_idx, row in sch.iterrows():
                     d = next((en for th, en in d_map.items() if th in str(row.iloc[0])), None)
                     if d:
                         for c in range(1, len(row)):
                             if str(row.iloc[c]).lower() != 'nan' and len(str(row.iloc[c])) > 2:
                                 if 8+(c-1) <= 20: busy.append({'room': sheet.strip(), 'day': d, 'hour': 8+(c-1)})
-    except: pass
+    except Exception as e: st.error(f"Room Read Error: {e}")
     
     return all_courses, pd.DataFrame(rooms), pd.DataFrame(busy)
 
@@ -315,7 +274,9 @@ def generate_excel_report(sched1, sched2):
     majors = set()
     years = set()
     for s in all_scheds:
-        for c in s.assignment: majors.add(c.major); years.add(c.year)
+        for c in s.assignment:
+            majors.add(c.major)
+            years.add(c.year)
             
     thin = Border(left=Side('thin'), right=Side('thin'), top=Side('thin'), bottom=Side('thin'))
     
@@ -325,8 +286,13 @@ def generate_excel_report(sched1, sched2):
                 prog_name = 'ภาคปกติ' if program == 'Reg' else 'โครงการพิเศษ'
                 sheet_name = f"{major}-{year}-{program}"
                 
-                def draw_term(sched, start_row):
-                    data = [(c, d, t, r) for c, (d, t, r) in sched.assignment.items() if c.major==major and c.year==year and c.program==program]
+                def get_data(sched):
+                    return [
+                        (c, d, t, r) for c, (d, t, r) in sched.assignment.items()
+                        if c.major == major and c.year == year and c.program == program
+                    ]
+
+                def draw_term(data, start_row):
                     df = pd.DataFrame('', index=Config.DAYS, columns=[f"{h}:00-{h+1}:00" for h in Config.TIME_SLOTS])
                     colors = {}
                     for c, d, t, r in data:
@@ -341,8 +307,8 @@ def generate_excel_report(sched1, sched2):
                                     colors[(Config.DAYS.index(d)+start_row+1, (t+i-8)+2)] = bg
                     return df, colors
 
-                df1, c1 = draw_term(sched1, 4)
-                df2, c2 = draw_term(sched2, 15)
+                df1, c1 = draw_term(get_data(sched1), 4)
+                df2, c2 = draw_term(get_data(sched2), 15)
                 
                 df1.to_excel(writer, sheet_name=sheet_name, startrow=3)
                 df2.to_excel(writer, sheet_name=sheet_name, startrow=14)
@@ -350,7 +316,8 @@ def generate_excel_report(sched1, sched2):
                 ws = writer.sheets[sheet_name]
                 for r, txt in [(1, "ภาคต้น"), (13, "ภาคปลาย")]:
                     ws[f'A{r}'] = f"ตารางเรียน {Config.MAJOR_MAP.get(major, major)} ปี {year} ({prog_name}) - {txt}"
-                    ws.merge_cells(f'A{r}:M{r}'); ws[f'A{r}'].font = Font(size=14, bold=True); ws[f'A{r}'].alignment = Alignment(horizontal='center')
+                    ws.merge_cells(f'A{r}:M{r}')
+                    ws[f'A{r}'].font = Font(size=14, bold=True); ws[f'A{r}'].alignment = Alignment(horizontal='center')
                 
                 ws.column_dimensions['A'].width = 12
                 for i in range(2, 15): ws.column_dimensions[chr(64+i)].width = 18
@@ -367,7 +334,8 @@ def generate_excel_report(sched1, sched2):
                 failed = [c for s in all_scheds for c in s.failed_courses if c.major == major and c.year == year and c.program == program]
                 if failed:
                     ws.cell(row=24, column=1, value="⚠️ วิชาที่ลงไม่ได้:").font = Font(color="FF0000", bold=True)
-                    for i, f in enumerate(set(failed)): ws.cell(row=25+i, column=1, value=f"{f.code} {f.name}")
+                    for i, f in enumerate(set(failed)): 
+                        ws.cell(row=25+i, column=1, value=f"{f.code} {f.name}")
 
     writer.close()
     output.seek(0)
@@ -378,20 +346,25 @@ def generate_excel_report(sched1, sched2):
 # ==========================================
 st.set_page_config(page_title="KKU Scheduler Pro", layout="wide")
 st.title("🎓 ระบบจัดตารางเรียนอัตโนมัติ (KKU AI Scheduler)")
-st.markdown("### ขั้นตอนการใช้งาน")
-st.markdown("1. อัปโหลด **ไฟล์หลักสูตร** และ **ไฟล์ห้องเรียน** (จำเป็น)")
-st.markdown("2. (แนะนำ) อัปโหลด **ไฟล์วิชาต่างคณะ** (`วิชาต่างคณะ67.xlsx`) เพื่อล็อคเวลาเรียนวิชาพื้นฐาน")
+st.info("ระบบจัดการภาคปกติ/พิเศษ แยกอิสระ และกรองวิชาผี (Ghost Courses) ออกอัตโนมัติ")
 
-c1, c2, c3 = st.columns(3)
+c1, c2 = st.columns(2)
 f_course = c1.file_uploader("1. ไฟล์หลักสูตร (kku30...)", type=['xlsx'])
 f_room = c2.file_uploader("2. ไฟล์ห้องเรียน (LAB...)", type=['xlsx'])
-f_fixed = c3.file_uploader("3. ไฟล์วิชาต่างคณะ (Optional)", type=['xlsx'])
+
+# *** NEW: ช่องกรอกวิชาผี ***
+blacklist_input = st.text_area("🚫 รายวิชาที่ต้องการลบออก (พิมพ์รหัสวิชา คั่นด้วยจุลภาค)", 
+                               placeholder="เช่น SC402101, GE101001 (วิชาเหล่านี้จะไม่ถูกนำมาจัดตาราง)")
 
 if f_course and f_room:
     if st.button("🚀 เริ่มจัดตาราง", type="primary"):
         with st.spinner("⏳ กำลังประมวลผล..."):
             try:
-                courses, rooms, busy = extract_data_v3(f_course, f_room, f_fixed)
+                # แปลง Blacklist เป็น List
+                blacklist = [x.strip() for x in blacklist_input.split(',') if x.strip()]
+                
+                courses, rooms, busy = extract_data_v18(f_course, f_room, blacklist)
+                
                 if not courses or rooms.empty: st.error("❌ ไม่พบข้อมูลในไฟล์")
                 else:
                     scheds = {}
@@ -402,8 +375,8 @@ if f_course and f_room:
                         scheds[t] = s
                     
                     xls = generate_excel_report(scheds[1], scheds[2])
-                    st.success("✅ เสร็จสมบูรณ์! แยกภาคปกติ/พิเศษ และล็อควิชาต่างคณะเรียบร้อย")
-                    st.download_button("📥 ดาวน์โหลดไฟล์ Excel", xls, "Final_Schedule_V17.xlsx", 
+                    st.success("✅ เสร็จสมบูรณ์!")
+                    st.download_button("📥 ดาวน์โหลดไฟล์ Excel", xls, "Final_Schedule_Fixed.xlsx", 
                                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
                                      use_container_width=True)
             except Exception as e: st.error(f"Error: {e}")
