@@ -271,7 +271,9 @@ def generate_excel_report(sched1, sched2):
     for s in [sched1, sched2]:
         for c in s.assignment: majors.add(list(c.majors)[0]); years.add(c.year)
     
-    thin_border = Border(left=Side('thin'), right=Side('thin'), top=Side('thin'), bottom=Side('thin'))
+    # ------------------ แก้ไขตรงนี้ (เปลี่ยน thin_border เป็น thin) ------------------
+    thin = Border(left=Side('thin'), right=Side('thin'), top=Side('thin'), bottom=Side('thin'))
+    # -------------------------------------------------------------------------
     
     for major in sorted(list(majors)):
         for year in sorted(list(years)):
@@ -315,7 +317,7 @@ def generate_excel_report(sched1, sched2):
                 for r_start, r_end, c_map in [(4, 11, col1), (15, 22, col2)]:
                     for row in ws.iter_rows(min_row=r_start, max_row=r_end, min_col=1, max_col=13):
                         for cell in row:
-                            cell.border = thin
+                            cell.border = thin # ใช้ตัวแปร thin ที่ถูกต้องแล้ว
                             cell.alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
                             if (cell.row, cell.column) in c_map:
                                 c = c_map[(cell.row, cell.column)]
@@ -323,13 +325,20 @@ def generate_excel_report(sched1, sched2):
                             elif cell.row == r_start or cell.column == 1:
                                 cell.fill = PatternFill(start_color="EEEEEE", end_color="EEEEEE", fill_type='solid')
                                 cell.font = Font(bold=True)
+                
+                # Check Failed Courses
+                failed = [c for c in sched1.failed_courses + sched2.failed_courses if major in c.majors and c.year == year]
+                if failed:
+                    ws.cell(row=24, column=1, value="⚠️ รายวิชาที่จัดไม่ลง (FAILED):").font = Font(color="FF0000", bold=True)
+                    for i, fc in enumerate(set(failed)):
+                        ws.cell(row=25+i, column=1, value=f"{'/'.join(fc.codes)} {fc.name}")
 
     writer.close()
     output.seek(0)
     return output
 
 # ==========================================
-# 4. APP INTERFACE
+# 🖥️ APP INTERFACE
 # ==========================================
 st.set_page_config(page_title="KKU Scheduler", layout="wide")
 st.title("🎓 ระบบจัดตารางเรียนอัตโนมัติ (KKU AI Scheduler)")
