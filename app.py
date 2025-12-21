@@ -270,7 +270,7 @@ def generate_excel(assignments, active_days):
 # ==========================================
 # 🖥️ PART 5: USER INTERFACE
 # ==========================================
-st.title("🎓 KKU Scheduler (Fixed Missing Courses)")
+st.title("🎓 KKU Scheduler")
 
 with st.sidebar:
     st.header("1. Upload Files")
@@ -398,3 +398,4 @@ if st.button("🚀 Start Scheduling", type="primary"):
                 st.error("❌ Solver Timeout: ลองลดจำนวนวิชา หรือเพิ่มตัวช่วยใน Sidebar")
     else:
         st.info("กรุณาอัปโหลดไฟล์ Rooms และ Subjects เป็นอย่างน้อย")
+
