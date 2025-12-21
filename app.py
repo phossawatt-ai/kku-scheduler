@@ -6,330 +6,417 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
 
 # ==========================================
-# ⚙️ CONFIGURATION
+# ⚙️ 1. CONFIGURATION & CONSTANTS
 # ==========================================
 class Config:
+    DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']
+    TIME_SLOTS = range(8, 20)  # 08:00 - 20:00
+    LUNCH_BREAK_HOUR = 12      # ห้ามเรียนช่วง 12:00 - 13:00
+    
+    # สีสำหรับ Excel (แยกตามรหัสวิชา)
     COLOR_MAP = {
-        'SC': 'FFF59D', 'CP': 'B3E5FC', 'LI': 'C8E6C9',
-        'EN': 'C8E6C9', 'GE': 'FFE0B2', 'DEFAULT': 'F5F5F5'
+        'SC': 'FFF59D', # เหลืองอ่อน
+        'CP': 'B3E5FC', # ฟ้าอ่อน
+        'LI': 'C8E6C9', # เขียวอ่อน
+        'GE': 'FFE0B2', # ส้มอ่อน
+        'EN': 'E1BEE7', # ม่วงอ่อน
+        'DEFAULT': 'F5F5F5' # เทา
     }
-    DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'] # ตัดเสาร์อาทิตย์ออกตามโจทย์
-    TIME_SLOTS = range(8, 20) # 08:00 - 20:00
 
 # ==========================================
-# 📦 DATA MODELS (ปรับให้เข้ากับ CSV ของเรา)
+# 📦 2. DATA STRUCTURES (CLASS)
 # ==========================================
 class Course:
     def __init__(self, data):
-        self.code = data['course_code']
-        self.name = data['course_name']
-        self.major = data.get('For_Major', 'Gen') # CS, AI, etc.
-        self.year = int(data.get('year', 1))
+        self.code = str(data.get('course_code', 'N/A')).strip()
+        self.name = str(data.get('course_name', 'Unknown')).strip()
+        self.major = data.get('For_Major', 'Gen')   # สาขาเจ้าของวิชา
+        self.year = int(data.get('year', 1))        # ชั้นปี
+        self.program = data.get('program', 'Regular') # Regular / Special
         
-        # Lec/Lab Logic
-        # ถ้า lecture_hours > 0 ให้สร้างเป็น Lec
-        # (ในโค้ดนี้เราจะแยก Lec/Lab ตั้งแต่ตอนโหลด)
-        self.type = data['type'] # 'Lec' or 'Lab'
-        self.duration = int(data['duration'])
-        
-        # Teacher & Student
+        self.type = data.get('type', 'Lec')         # Lec / Lab
+        self.duration = int(data.get('duration', 3))
         self.instructor = str(data.get('instructor', 'TBA'))
-        self.student_group = f"{self.major}_Y{self.year}" # e.g. CS_Y1
-        self.students = 50 # Default ไปก่อนถ้าไม่มีข้อมูล
         
-        # Fixed Data
+        self.students = int(data.get('student_count', 40)) # จำนวนคนเรียน
+        
+        # ID ที่ไม่ซ้ำกัน (ใช้เป็น Key ใน Solver)
+        self.uid = f"{self.major}_{self.year}_{self.program}_{self.code}_{self.type}_{id(self)}"
+        
+        # ข้อมูล Fixed (ถ้ามี)
         self.is_fixed = False
-        self.fixed_day = None
-        self.fixed_time = None
-        self.fixed_room = None
-        
-        # Unique ID
-        self.uid = f"{self.code}_{self.major}_{self.type}_{id(self)}"
+        self.fix_day = None
+        self.fix_time = None
+        self.fix_room = None
 
     def __repr__(self):
-        return f"[{self.major}] {self.code} ({self.type})"
+        return f"[{self.major} Y{self.year} {self.program}] {self.code} ({self.type})"
 
 # ==========================================
-# 🧠 OR-TOOLS ENGINE (คงเดิมแต่ปรับปรุง Input)
+# 🧠 3. SOLVER ENGINE (OR-TOOLS)
 # ==========================================
 class UniversityScheduler:
-    def __init__(self, courses_list, rooms_df, fixed_data):
-        self.rooms = sorted(rooms_df.to_dict('records'), key=lambda x: x['capacity'])
-        self.courses = courses_list
-        self.fixed_schedule = fixed_data # format: {(day, time, room): course_code}
-        self.assignment = {}
+    def __init__(self, courses, rooms, fixed_data):
+        self.courses = courses
+        self.rooms = sorted(rooms, key=lambda x: x['capacity']) # เรียงห้องเล็ก -> ใหญ่
+        self.fixed_data = fixed_data # Map: (day, time, room) -> details
+        self.assignments = {}
         self.failed_courses = []
-
+        
     def solve(self):
         model = cp_model.CpModel()
-        shifts = {} 
+        shifts = {} # เก็บตัวแปร Boolean
         
-        # 1. แบ่งวิชาเป็น Fixed กับ Variable
-        courses_to_solve = []
+        # กรองวิชาที่จะนำมาจัดตาราง (ถ้า Fixed มาแล้วถือว่าจบ)
+        courses_to_solve = self.courses
         
-        for c in self.courses:
-            # เช็คว่าวิชานี้โดน Fix หรือไม่
-            # (Logic นี้อาจต้องปรับถ้า Fixed File ระบุละเอียดกว่านี้)
-            is_fixed_match = False
-            if c.is_fixed:
-                 self.assignment[c] = (c.fixed_day, c.fixed_time, c.fixed_room)
-                 is_fixed_match = True
-            
-            if not is_fixed_match:
-                courses_to_solve.append(c)
+        print(f"🧩 เริ่มประมวลผล: {len(courses_to_solve)} รายการวิชา")
 
-        # 2. สร้างตัวแปร (Variables)
-        print(f"🧩 กำลังจัดตารางให้: {len(courses_to_solve)} วิชา")
-        
+        # --- A. สร้างตัวแปร (Variables) ---
         for c in courses_to_solve:
-            # กรองห้องที่ประเภทตรงกันและจุคนพอ
-            valid_rooms = [r for r in self.rooms if r['capacity'] >= c.students]
-            pref_rooms = [r for r in valid_rooms if r['type'].lower() == c.type.lower()]
-            if not pref_rooms: pref_rooms = valid_rooms # ยืดหยุ่นถ้าห้อง Lab เต็มให้ลง Lec ได้ไหม? (อาจต้องแก้ตรงนี้)
+            
+            # กรองห้องที่ "จุคนพอ" และ "ประเภทถูก"
+            # (อนุโลม: ห้อง Lec ใช้ห้อง Lab ได้ไหม? ปกติไม่ได้ แต่ Lab ใช้ Lec สอนบรรยายได้)
+            valid_rooms = []
+            for r in self.rooms:
+                if r['capacity'] >= c.students:
+                    # Logic เลือกประเภทห้อง
+                    if c.type.lower() == 'lab':
+                        if 'lab' in r['type'].lower(): valid_rooms.append(r)
+                    else:
+                        # Lecture ลงได้ทั้งห้อง Lec และห้อง Lab (ถ้าจำเป็น)
+                        valid_rooms.append(r)
+            
+            if not valid_rooms:
+                print(f"⚠️ Warning: วิชา {c} ({c.students} คน) ไม่มีห้องรองรับเลย")
+                continue
 
             for d in Config.DAYS:
                 for h in Config.TIME_SLOTS:
+                    # 1. เช็คเวลาจบไม่เกิน 20:00
                     if h + c.duration > 20: continue
                     
-                    # 🥗 เงื่อนไข: ห้ามเรียนตอนพักเที่ยง (12:00-13:00)
-                    # ถ้าช่วงเวลาเรียน ไปทับ 12:00 (คือเลข 12) ให้ข้าม
-                    # ช่วงเรียนคือ range(h, h + c.duration)
-                    if 12 in range(h, h + c.duration): continue 
+                    # 2. 🥗 เช็คพักเที่ยง (ห้ามเรียนคาบ 12:00-13:00)
+                    # ช่วงเรียนคือ [h, h+1, ..., h+duration-1]
+                    # ถ้า 12 อยู่ในช่วงนี้ ถือว่าผิด
+                    learning_hours = range(h, h + c.duration)
+                    if Config.LUNCH_BREAK_HOUR in learning_hours: continue
                     
-                    for r in pref_rooms:
-                        # เช็ค Fixed Schedule (ห้องนี้เวลานี้ว่างไหม)
-                        is_busy = False
-                        for t in range(h, h + c.duration):
-                             if (d, t, r['room_name']) in self.fixed_schedule:
-                                 is_busy = True; break
-                        if is_busy: continue
+                    for r in valid_rooms:
+                        # 3. เช็คตาราง Fixed (ห้องต้องว่าง)
+                        is_room_busy_by_fixed = False
+                        for t in learning_hours:
+                            if (d, t, r['name']) in self.fixed_data:
+                                is_room_busy_by_fixed = True
+                                break
+                        if is_room_busy_by_fixed: continue
 
-                        shifts[(c.uid, d, h, r['room_name'])] = model.NewBoolVar(f'shift_{c.uid}_{d}_{h}_{r["room_name"]}')
+                        # สร้างตัวแปร
+                        var_name = f'shift_{c.uid}_{d}_{h}_{r["name"]}'
+                        shifts[(c.uid, d, h, r['name'])] = model.NewBoolVar(var_name)
 
-        # 3. Constraints
-        # C1: วิชาหนึ่งเรียนแค่ครั้งเดียว
+        # --- B. สร้างเงื่อนไข (Constraints) ---
+        
+        # C1: วิชาหนึ่งต้องลง 1 ครั้งเท่านั้น
         for c in courses_to_solve:
             c_shifts = [shifts[key] for key in shifts if key[0] == c.uid]
             if c_shifts:
                 model.Add(sum(c_shifts) == 1)
             else:
-                self.failed_courses.append(c)
+                self.failed_courses.append(c) # จัดไม่ได้เพราะไม่มี Slot ลง
 
-        # Map เพื่อเช็คการชน
-        # Key: (Day, Hour) -> List of {type, room, teacher, group, var}
-        time_slot_map = {} 
-
-        # ใส่ Fixed Data ลงใน Map
-        for (d, t, r_name), code in self.fixed_schedule.items():
+        # เตรียม Map เช็คการชน
+        # Key: (Day, Hour) -> List of usage
+        time_map = {}
+        
+        # ใส่ Fixed Data ลง Map
+        for (d, t, r_name), info in self.fixed_data.items():
             key = (d, t)
-            if key not in time_slot_map: time_slot_map[key] = []
-            time_slot_map[key].append({'type': 'fixed', 'room': r_name, 'instr': 'FIXED', 'grp': 'FIXED'})
+            if key not in time_map: time_map[key] = []
+            # Fixed ถือว่าเป็น Resource ที่ถูกใช้ไปแล้ว
+            time_map[key].append({'type': 'fixed', 'room': r_name, 'grp': 'FIXED'})
 
-        # ใส่ Variable Data
+        # ใส่ Variable Data ลง Map
         for (uid, d, h, r_name), var in shifts.items():
-            c = next(x for x in courses_to_solve if x.uid == uid)
+            c = next(course for course in courses_to_solve if course.uid == uid)
             for i in range(c.duration):
                 key = (d, h + i)
-                if key not in time_slot_map: time_slot_map[key] = []
-                time_slot_map[key].append({'type': 'var', 'var': var, 'room': r_name, 'instr': c.instructor, 'grp': c.student_group})
+                if key not in time_map: time_map[key] = []
+                
+                # Composite Key สำหรับเช็คกลุ่มเรียนชนกัน
+                # เช่น CS ปี 1 ภาคปกติ (CS_1_Regular) ห้ามเรียนซ้อน
+                group_key = f"{c.major}_{c.year}_{c.program}"
+                
+                time_map[key].append({
+                    'type': 'var', 
+                    'var': var, 
+                    'room': r_name, 
+                    'grp': group_key, 
+                    'instr': c.instructor
+                })
 
-        # C2: Conflict Checks
-        for slot, items in time_slot_map.items():
-            # 2.1 Room Conflict (ห้ามห้องซ้อน)
-            rooms_map = {}
+        # C2: Loop เช็ค Conflict ในแต่ละ Slot เวลา
+        for slot, items in time_map.items():
+            
+            # 2.1 ห้ามห้องซ้อน (Room Conflict)
+            room_usage = {}
             for item in items:
                 r = item['room']
-                if r not in rooms_map: rooms_map[r] = []
-                if item['type'] == 'var': rooms_map[r].append(item['var'])
-                else: rooms_map[r].append(1) # Fixed occupied
-            
-            for r, vars_list in rooms_map.items():
-                has_fixed = any(isinstance(v, int) for v in vars_list)
-                if has_fixed:
-                    # ถ้ามี Fixed อยู่แล้ว ตัวแปรอื่นต้องเป็น 0 ทั้งหมด
-                    for v in vars_list:
+                if r not in room_usage: room_usage[r] = []
+                if item['type'] == 'var': room_usage[r].append(item['var'])
+                else: room_usage[r].append(1) # Fixed
+
+            for r, vars in room_usage.items():
+                # ถ้ามี Fixed อยู่แล้ว (1) ตัวแปรอื่นต้องเป็น 0
+                if any(isinstance(v, int) for v in vars):
+                    for v in vars:
                         if not isinstance(v, int): model.Add(v == 0)
                 else:
-                    # ถ้าไม่มี Fixed ให้เลือกได้แค่ 1 ตัวแปร
-                    if len(vars_list) > 1: model.Add(sum(vars_list) <= 1)
+                    # ถ้าไม่มี Fixed เลือกได้แค่ 1 วิชา
+                    if len(vars) > 1: model.Add(sum(vars) <= 1)
 
-            # 2.2 Teacher Conflict & Student Group Conflict
-            # (ใช้ Logic เดียวกัน: Group by Resource -> Sum <= 1)
-            for key_type in ['instr', 'grp']:
-                res_map = {}
+            # 2.2 ห้ามกลุ่มเรียนซ้อน (Student Group Conflict)
+            # 2.3 ห้ามอาจารย์ซ้อน (Instructor Conflict)
+            for check_key in ['grp', 'instr']:
+                res_usage = {}
                 for item in items:
-                    val = item[key_type]
-                    if val == 'FIXED' or val == 'TBA' or val == '-': continue
-                    if val not in res_map: res_map[val] = []
-                    if item['type'] == 'var': res_map[val].append(item['var'])
+                    val = item.get(check_key)
+                    if not val or val == 'TBA' or val == 'FIXED': continue
+                    
+                    if val not in res_usage: res_usage[val] = []
+                    if item['type'] == 'var': res_usage[val].append(item['var'])
                 
-                for res, vars_list in res_map.items():
-                    if len(vars_list) > 1: model.Add(sum(vars_list) <= 1)
+                for res, vars in res_usage.items():
+                    if len(vars) > 1: model.Add(sum(vars) <= 1)
 
-        # 4. Objectives (Minimize Late Classes)
+        # --- C. เป้าหมาย (Objectives) ---
+        # พยายามไม่ให้เลิกดึก (หลัง 17:00)
         penalties = []
         for (uid, d, h, r_name), var in shifts.items():
-            if h >= 17: penalties.append(var * 10) # เลิกเย็นโดนหักคะแนน
-        
-        if penalties: model.Minimize(sum(penalties))
+            if h >= 17:
+                penalties.append(var * 10) 
+        if penalties:
+            model.Minimize(sum(penalties))
 
-        # 5. Run Solver
+        # --- D. Run Solver ---
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 60.0
+        solver.parameters.max_time_in_seconds = 120.0 # ให้เวลาคิด 2 นาที
         status = solver.Solve(model)
 
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             for (uid, d, h, r_name), var in shifts.items():
                 if solver.Value(var) == 1:
-                    c = next(x for x in courses_to_solve if x.uid == uid)
-                    self.assignment[c] = (d, h, r_name)
+                    c = next(course for course in courses_to_solve if course.uid == uid)
+                    self.assignments[c] = (d, h, r_name)
             return True
         else:
             return False
 
 # ==========================================
-# 📊 EXPORT EXCEL (ของเดิม - ดีอยู่แล้ว)
+# 📊 4. EXCEL GENERATOR
 # ==========================================
-def generate_excel_report(sched):
+def generate_excel(assignments):
     output = io.BytesIO()
-    writer = pd.ExcelWriter(output, engine='openpyxl')
+    wb = Workbook()
+    wb.remove(wb.active) # ลบ Sheet default
     
-    # รวมข้อมูล Fixed และ Assigned
-    # (ในตัวอย่างนี้ขอทำแบบง่ายเฉพาะที่ Assign ได้ก่อน)
+    # Group ข้อมูลตาม Sheet: Major_Year_Program
+    # ตัวอย่าง Key: "CS_Y1_Regular"
+    sheet_data = {}
     
-    majors = set(c.major for c in sched.assignment.keys())
-    
-    thin = Border(left=Side('thin'), right=Side('thin'), top=Side('thin'), bottom=Side('thin'))
-    
-    for major in sorted(list(majors)):
-        sheet_name = f"{major}"
-        data = [(c, d, t, r) for c, (d, t, r) in sched.assignment.items() if c.major == major]
+    for c, (d, t, r) in assignments.items():
+        key = f"{c.major}_Y{c.year}_{c.program}"
+        if key not in sheet_data: sheet_data[key] = []
+        sheet_data[key].append((c, d, t, r))
         
-        # สร้าง DataFrame ตารางเรียน
-        df_disp = pd.DataFrame('', index=Config.DAYS, columns=[f"{h}:00" for h in Config.TIME_SLOTS])
-        colors = {}
+    # Style
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    
+    # Loop สร้าง Sheet
+    for sheet_name in sorted(sheet_data.keys()):
+        ws = wb.create_sheet(title=sheet_name[:31]) # Excel จำกัดชื่อ Sheet 31 ตัวอักษร
         
-        for c, d, t, r in data:
-            bg = Config.COLOR_MAP.get(c.code[:2].upper(), Config.COLOR_MAP['DEFAULT'])
-            txt = f"{c.code}\n{c.name}\n{r}"
+        # Header
+        ws.merge_cells('A1:N1')
+        ws['A1'] = f"ตารางเรียน {sheet_name}"
+        ws['A1'].font = Font(size=14, bold=True)
+        ws['A1'].alignment = center_align
+        
+        # Table Header (Times)
+        ws['A2'] = "Day/Time"
+        for i, h in enumerate(Config.TIME_SLOTS):
+            col_char = chr(66 + i) # B, C, D...
+            ws[f'{col_char}2'] = f"{h}:00"
+            ws.column_dimensions[col_char].width = 15
             
+        # Fill Days
+        row_map = {d: i+3 for i, d in enumerate(Config.DAYS)}
+        for d, r_idx in row_map.items():
+            ws[f'A{r_idx}'] = d
+            ws[f'A{r_idx}'].font = Font(bold=True)
+            
+        # Fill Data
+        for c, d, t, r in sheet_data[sheet_name]:
+            if d not in row_map: continue
+            row_idx = row_map[d]
+            
+            # Fill ตามจำนวนชั่วโมง
             for i in range(c.duration):
-                h_col = t + i
-                if 8 <= h_col < 20:
-                    col_name = f"{h_col}:00"
-                    if d in df_disp.index and col_name in df_disp.columns:
-                        df_disp.at[d, col_name] = txt
-                        colors[(Config.DAYS.index(d)+2, h_col - 8 + 2)] = bg # Row, Col offset
+                h_current = t + i
+                if h_current in Config.TIME_SLOTS:
+                    col_idx = Config.TIME_SLOTS.index(h_current) + 2 # +2 เพราะเริ่ม col B
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    
+                    # ข้อมูลในช่อง
+                    txt = f"{c.code}\n{c.name}\n{r} ({c.instructor})"
+                    cell.value = txt
+                    cell.alignment = center_align
+                    cell.border = thin_border
+                    
+                    # สีพื้นหลัง
+                    color_code = Config.COLOR_MAP.get(c.code[:2].upper(), Config.COLOR_MAP['DEFAULT'])
+                    cell.fill = PatternFill(start_color=color_code, end_color=color_code, fill_type='solid')
 
-        df_disp.to_excel(writer, sheet_name=sheet_name)
-        
-        # จัด Format Excel
-        ws = writer.sheets[sheet_name]
-        for r in range(2, 2 + len(Config.DAYS)):
-            for c in range(2, 2 + len(Config.TIME_SLOTS)):
-                cell = ws.cell(row=r, column=c)
-                cell.border = thin
-                cell.alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
-                
-                if (r, c) in colors:
-                    cell.fill = PatternFill(start_color=colors[(r,c)], end_color=colors[(r,c)], fill_type='solid')
-
-    writer.close()
+    wb.save(output)
     output.seek(0)
     return output
 
 # ==========================================
-# 🖥️ APP INTERFACE (ปรับใหม่รับ CSV)
+# 🖥️ 5. USER INTERFACE (STREAMLIT)
 # ==========================================
-st.set_page_config(page_title="KKU Scheduler (Hybrid)", layout="wide")
-st.title("🎓 ระบบจัดตารางเรียนอัตโนมัติ (CSV + OR-Tools)")
+st.set_page_config(page_title="KKU Scheduler Pro", layout="wide")
+
+st.title("🎓 ระบบจัดตารางเรียนอัตโนมัติ (แยกภาค/ชั้นปี)")
+st.info("ระบบจะอ่านไฟล์นักศึกษา เพื่อแยกตารางเรียนภาคปกติ (Regular) และภาคพิเศษ (Special) ให้โดยอัตโนมัติ")
 
 with st.sidebar:
-    st.header("1. Upload Files")
-    f_rooms = st.file_uploader("ไฟล์ห้องเรียน (rooms_data_flat.csv)", type=['csv'])
-    f_subjects = st.file_uploader("ไฟล์รายวิชา (subjects_XX.csv)", type=['csv'], accept_multiple_files=True)
-    f_fixed = st.file_uploader("ไฟล์ Fixed (schedule_fix.csv)", type=['csv'], accept_multiple_files=True)
+    st.header("📂 1. Upload Data")
+    f_rooms = st.file_uploader("1. ไฟล์ห้องเรียน (rooms_data_flat.csv)", type=['csv'])
+    f_students = st.file_uploader("2. ไฟล์นักศึกษา (students_cleaned.csv)", type=['csv'])
+    f_subjects = st.file_uploader("3. ไฟล์รายวิชา (subjects_XX.csv)", type=['csv'], accept_multiple_files=True)
+    f_fixed = st.file_uploader("4. ไฟล์ Fixed (Optional)", type=['csv'], accept_multiple_files=True)
 
-if st.button("🚀 เริ่มจัดตาราง", type="primary"):
-    if f_rooms and f_subjects:
+if st.button("🚀 เริ่มจัดตาราง (Start Scheduling)", type="primary"):
+    if f_rooms and f_students and f_subjects:
         with st.spinner("⏳ กำลังอ่านข้อมูลและประมวลผล..."):
             
-            # 1. อ่านข้อมูลห้อง
+            # --- STEP 1: LOAD ROOMS ---
             df_rooms = pd.read_csv(f_rooms)
+            rooms_list = []
+            for _, r in df_rooms.iterrows():
+                rooms_list.append({
+                    'name': str(r['room_name']),
+                    'capacity': int(r['capacity']),
+                    'type': str(r['type']).lower()
+                })
             
-            # 2. อ่านข้อมูลวิชา (รวมทุกไฟล์)
+            # --- STEP 2: LOAD STUDENTS & PREPARE GROUPS ---
+            # Map: (Major, Year, Program) -> Student Count
+            df_students = pd.read_csv(f_students)
+            student_map = {}
+            programs_map = {} # (Major, Year) -> [Regular, Special]
+            
+            for _, row in df_students.iterrows():
+                maj = row['major']
+                yr = int(row['year'])
+                prog = row['program'] # 'Regular', 'Special'
+                cnt = int(row['student_count'])
+                
+                if cnt > 0:
+                    student_map[(maj, yr, prog)] = cnt
+                    
+                    if (maj, yr) not in programs_map: programs_map[(maj, yr)] = []
+                    if prog not in programs_map[(maj, yr)]: programs_map[(maj, yr)].append(prog)
+            
+            # --- STEP 3: LOAD SUBJECTS & EXPLODE ---
             all_courses = []
             for f in f_subjects:
-                df = pd.read_csv(f)
-                # ดึงชื่อสาขาจากชื่อไฟล์ (เช่น subjects_CS.csv -> CS)
-                major_name = f.name.split('_')[1].split('.')[0]
+                df_sub = pd.read_csv(f)
+                # ดึงชื่อสาขาจากชื่อไฟล์ (subjects_CS.csv -> CS)
+                major_file = f.name.split('_')[1].split('.')[0]
                 
-                for _, row in df.iterrows():
-                    # แตก Lec/Lab
-                    if row['lecture_hours'] > 0:
-                        data = row.to_dict()
-                        data['For_Major'] = major_name
-                        data['type'] = 'Lec'
-                        data['duration'] = row['lecture_hours']
-                        all_courses.append(Course(data))
+                for _, row in df_sub.iterrows():
+                    yr = int(row['year'])
+                    
+                    # หากลุ่มเรียนที่มีอยู่จริงของสาขานี้ ปีนี้
+                    available_programs = programs_map.get((major_file, yr), ['Regular']) # Default Regular if not found
+                    
+                    # *** Loop สร้างวิชาตามจำนวนภาคที่มี ***
+                    for prog in available_programs:
+                        # ดึงจำนวนนักศึกษา
+                        count = student_map.get((major_file, yr, prog), 50)
                         
-                    if row['lab_hours'] > 0:
-                        data = row.to_dict()
-                        data['For_Major'] = major_name
-                        data['type'] = 'Lab'
-                        data['duration'] = row['lab_hours']
-                        # Lab ต้องเรียนแยกห้องกับ Lec ไหม? (ในที่นี้แยก object กันชัดเจน)
-                        all_courses.append(Course(data))
-
-            # 3. อ่าน Fixed Schedule
-            fixed_data = {} # (day, time, room) -> code
+                        # สร้าง Lec
+                        if row['lecture_hours'] > 0:
+                            data = row.to_dict()
+                            data['For_Major'] = major_file
+                            data['program'] = prog # <--- Assign Program
+                            data['student_count'] = count
+                            data['type'] = 'Lec'
+                            data['duration'] = row['lecture_hours']
+                            all_courses.append(Course(data))
+                        
+                        # สร้าง Lab
+                        if row['lab_hours'] > 0:
+                            data = row.to_dict()
+                            data['For_Major'] = major_file
+                            data['program'] = prog # <--- Assign Program
+                            data['student_count'] = count
+                            data['type'] = 'Lab'
+                            data['duration'] = row['lab_hours']
+                            all_courses.append(Course(data))
+            
+            # --- STEP 4: LOAD FIXED SCHEDULE ---
+            # Map: (day, time, room_name) -> Info
+            fixed_data = {}
             if f_fixed:
                 for f in f_fixed:
                     df_fix = pd.read_csv(f)
                     for _, row in df_fix.iterrows():
-                        # แปลงเวลาเริ่ม 09:00 -> 9
                         try:
-                            start_h = int(float(row['start_time'].split(':')[0]))
-                            end_h = int(float(row['end_time'].split(':')[0]))
-                            duration = end_h - start_h
-                            room = row['room']
-                            day = row['day'] # ต้องเป็น Mon, Tue...
+                            # Parse Time (09:00 -> 9)
+                            start_str = str(row['start_time']).split(':')[0]
+                            end_str = str(row['end_time']).split(':')[0]
+                            start_h = int(float(start_str))
+                            end_h = int(float(end_str))
                             
-                            for i in range(duration):
-                                fixed_data[(day, start_h + i, room)] = row['course_code']
+                            r_name = str(row['room'])
+                            day_val = str(row['day']) # Mon, Tue...
+                            
+                            for t in range(start_h, end_h):
+                                fixed_data[(day_val, t, r_name)] = row['course_code']
                                 
-                            # อัปเดต Course object ว่าวิชานี้ Fixed
-                            # (ทำแบบง่าย: วนลูปหา code ที่ตรงกัน)
-                            for c in all_courses:
-                                if c.code == row['course_code']:
-                                    c.is_fixed = True
-                                    c.fixed_day = day
-                                    c.fixed_time = start_h
-                                    c.fixed_room = room
-                        except:
-                            pass
+                                # Note: ถ้าจะให้ดีต้องไป Mark ที่ตัว Course Object ด้วยว่า Fixed
+                                # แต่ใน version นี้เอาแค่บล็อคห้องไม่ให้คนอื่นใช้ก่อน
+                        except Exception as e:
+                            pass # ข้าม row ที่ error
 
-            # 4. รัน Solver
-            scheduler = UniversityScheduler(all_courses, df_rooms, fixed_data)
+            st.write(f"✅ เตรียมข้อมูลเสร็จสิ้น: {len(all_courses)} วิชาที่ต้องจัดตาราง")
+
+            # --- STEP 5: RUN SOLVER ---
+            scheduler = UniversityScheduler(all_courses, rooms_list, fixed_data)
             success = scheduler.solve()
             
             if success:
-                st.success(f"✅ จัดตารางสำเร็จ! ({len(scheduler.assignment)} วิชา)")
+                st.success(f"🎉 จัดตารางสำเร็จ! ({len(scheduler.assignments)} วิชา)")
                 
-                # Export Excel
-                xls_data = generate_excel_report(scheduler)
-                st.download_button("📥 ดาวน์โหลดตารางเรียน (Excel)", 
-                                   xls_data, 
-                                   "Final_Schedule.xlsx",
-                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                # --- STEP 6: EXPORT EXCEL ---
+                excel_file = generate_excel(scheduler.assignments)
+                st.download_button(
+                    label="📥 ดาวน์โหลดไฟล์ Excel (แยก Sheet ตามภาค)",
+                    data=excel_file,
+                    file_name="University_Timetable_Complete.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
                 
-                # แสดงผล Failed Courses
+                # Show Failed
                 if scheduler.failed_courses:
-                    st.error(f"⚠️ มี {len(scheduler.failed_courses)} วิชาที่ลงไม่ได้:")
-                    for fc in scheduler.failed_courses:
-                        st.write(f"- {fc}")
+                    st.error(f"⚠️ มี {len(scheduler.failed_courses)} วิชาที่ลงไม่ได้ (ห้องเต็ม/เวลาเต็ม):")
+                    for c in scheduler.failed_courses:
+                        st.write(f"- {c} ({c.students} คน)")
             else:
-                st.error("❌ ไม่สามารถจัดตารางได้ (เงื่อนไขแน่นเกินไป)")
+                st.error("❌ ไม่สามารถจัดตารางได้ (เงื่อนไขแน่นเกินไป หรือห้องไม่พอ)")
 
     else:
-        st.warning("กรุณาอัปโหลดไฟล์ห้องเรียนและรายวิชา")
+        st.warning("กรุณาอัปโหลดไฟล์ 1, 2, 3 ให้ครบถ้วน")
