@@ -203,7 +203,11 @@ class UniversityScheduler:
 
         # --- D. Run Solver ---
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 120.0
+        solver.parameters.num_search_workers = 1  # บังคับใช้ CPU แค่ 1 Core (ประหยัด RAM สูงสุด)
+        solver.parameters.max_time_in_seconds = 60.0 # ลดเวลาลงเหลือ 60 วิ (ถ้าเกินให้ตัดจบเลย เอาเท่าที่ได้)
+        
+        # log การค้นหา (เผื่อไว้ดูใน Terminal)
+        solver.parameters.log_search_progress = True
         status = solver.Solve(model)
 
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
@@ -398,3 +402,4 @@ if st.button("🚀 Run Scheduler", type="primary"):
                             st.text(log)
             else:
                 st.error("Solver Error")
+
