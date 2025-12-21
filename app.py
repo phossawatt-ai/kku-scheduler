@@ -2,7 +2,7 @@ import streamlit as st
 # ------------------------------------------------------------------
 # ⚡️ PART 0: SYSTEM CONFIG
 # ------------------------------------------------------------------
-st.set_page_config(page_title="KKU Scheduler (Independent Sections)", layout="wide")
+st.set_page_config(page_title="KKU Scheduler (Fix ZeroDivision)", layout="wide")
 
 import pandas as pd
 import io
@@ -42,7 +42,7 @@ class Course:
         self.major = data.get('For_Major', 'Gen')
         self.year = int(data.get('year', 1))
         
-        self.program = data.get('program', 'Regular') # เก็บแค่โปรแกรมเดียว
+        self.program = data.get('program', 'Regular') 
         
         self.type = data.get('type', 'Lec')
         self.duration = int(data.get('duration', 3))
@@ -62,7 +62,7 @@ class Course:
 class UniversityScheduler:
     def __init__(self, courses, rooms, fixed_data, options):
         self.courses = courses
-        self.rooms = sorted(rooms, key=lambda x: x['capacity']) # เรียงห้องเล็กไปใหญ่
+        self.rooms = sorted(rooms, key=lambda x: x['capacity']) 
         self.fixed_data = fixed_data
         self.options = options 
         self.assignments = {}
@@ -94,7 +94,6 @@ class UniversityScheduler:
                 self.failed_courses.append(c)
                 continue
             
-            # Optimization: 10 Best Rooms
             valid_rooms = valid_rooms[:10]
 
             c_moves = []
@@ -138,7 +137,7 @@ class UniversityScheduler:
                 key = (d, h + i)
                 if key not in time_map: time_map[key] = []
                 
-                # Group Key: แยกตามภาคเลย (Regular ก็ Regular, Special ก็ Special)
+                # Group Key
                 grp_key = f"{c.major}_{c.year}_{c.program}"
                 
                 time_map[key].append({
@@ -148,7 +147,7 @@ class UniversityScheduler:
 
         # Check Conflicts
         for slot, items in time_map.items():
-            # 1. Room Conflict (ห้องเดียวกัน ห้ามใช้พร้อมกัน)
+            # Room Conflict
             room_usage = {}
             for item in items:
                 r = item['room']
@@ -163,20 +162,17 @@ class UniversityScheduler:
                 elif len(vars) > 1:
                     model.Add(sum(vars) <= 1)
 
-            # 2. Instructor Conflict (อาจารย์คนเดียว ห้ามสอน 2 Sec พร้อมกัน)
-            # นี่คือจุดสำคัญ! ถ้าอาจารย์คนเดียวกันสอนทั้งภาคปกติและพิเศษ Solver จะจับแยกเวลาให้เอง
+            # Instructor & Student Group Conflict
             instr_usage = {}
             grp_usage = {} 
             
             for item in items:
                 if item['type'] == 'var':
-                    # Check Instr
                     ins = item.get('instr')
                     if ins and ins != 'TBA':
                         if ins not in instr_usage: instr_usage[ins] = []
                         instr_usage[ins].append(item['var'])
                     
-                    # Check Student Group Conflict (กลุ่มเรียนเดียวกันห้ามเรียนซ้อน)
                     grp = item.get('grp')
                     if grp:
                         if grp not in grp_usage: grp_usage[grp] = []
@@ -188,13 +184,12 @@ class UniversityScheduler:
                 if len(vars) > 1: model.Add(sum(vars) <= 1)
 
         # --- C. Solve ---
-        # เพิ่ม Randomization ให้ Solver เลือกคำตอบที่หลากหลายขึ้น ไม่จำเจ
         model.Maximize(sum(scheduled_vars))
         
         solver = cp_model.CpSolver()
         solver.parameters.num_search_workers = 4 
         solver.parameters.max_time_in_seconds = 600.0
-        solver.parameters.random_seed = random.randint(0, 100) # สุ่ม Seed ทุกครั้งที่รัน
+        solver.parameters.random_seed = random.randint(0, 100)
         
         status = solver.Solve(model)
 
@@ -224,7 +219,6 @@ def generate_excel(assignments, active_days):
     
     sheet_data = {}
     for c, (d, t, r) in assignments.items():
-        # แยก Sheet ตาม Major + Year + Program ชัดเจน
         key = f"{c.major}_Y{c.year}_{c.program}"
         if key not in sheet_data: sheet_data[key] = []
         sheet_data[key].append((c, d, t, r))
@@ -278,8 +272,8 @@ def generate_excel(assignments, active_days):
 # ==========================================
 # 🖥️ PART 5: USER INTERFACE
 # ==========================================
-st.title("🎓 KKU Scheduler (Separated Sections Mode)")
-st.info("ℹ️ โหมดนี้จะแยก Sec ของภาคปกติและภาคพิเศษออกจากกัน เพื่อให้ตารางมีความยืดหยุ่นและไม่ซ้อนทับกันเกินไป")
+st.title("🎓 KKU Scheduler (Fixed ZeroDivisionError)")
+st.info("ℹ️ โหมดนี้แก้ปัญหาค่าเป็นศูนย์ (Zero Division) และแยก Sec ปกติ/พิเศษ ให้แล้วครับ")
 
 with st.sidebar:
     st.header("1. Upload Files")
@@ -290,14 +284,14 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("2. Options")
-    opt_force_special = st.checkbox("🔥 บังคับมีภาคพิเศษ (Force Special)", value=True, help="สร้าง Sec ภาคพิเศษให้ทุกวิชา แม้ไม่มีข้อมูลในไฟล์")
+    opt_force_special = st.checkbox("🔥 บังคับมีภาคพิเศษ (Force Special)", value=True)
     opt_saturday = st.checkbox("📅 เปิดสอนวันเสาร์", value=False)
     opt_lunch = st.checkbox("🍱 เรียนพักเที่ยงได้", value=False)
     opt_squeeze = st.checkbox("🪑 นั่งเบียดได้ 10%", value=True)
 
 if st.button("🚀 Start Scheduling", type="primary"):
     if f_rooms and f_subjects: 
-        with st.spinner("⏳ Creating Independent Sections..."):
+        with st.spinner("⏳ Analyzing Data..."):
             
             # 1. Rooms
             df_rooms = pd.read_csv(f_rooms)
@@ -314,7 +308,7 @@ if st.button("🚀 Start Scheduling", type="primary"):
                         std_summary[(maj, yr)][prog] = int(r['student_count'])
                     except: pass
             
-            # 3. Subjects Processing (CRITICAL CHANGE HERE)
+            # 3. Subjects Processing
             all_courses = []
             
             for f in f_subjects:
@@ -324,23 +318,22 @@ if st.button("🚀 Start Scheduling", type="primary"):
                 for _, row in df.iterrows():
                     yr = int(row['year'])
                     
-                    # ตรวจสอบว่าปีนี้มีภาคอะไรบ้าง
                     progs_in_year = std_summary.get((maj, yr), {})
                     
-                    # Safety Net: ถ้าไม่มีข้อมูล ให้ Default Regular
                     if not progs_in_year:
                         progs_in_year = {'Regular': Config.DEFAULT_REGULAR}
                     
-                    # Force Special: ถ้า User สั่ง และยังไม่มี Special ให้เติมเข้าไป
                     if opt_force_special and 'Special' not in progs_in_year:
                         progs_in_year['Special'] = Config.DEFAULT_SPECIAL
 
-                    # 🔄 LOOP แยกแต่ละภาคเลย (ไม่รวมยอดแล้ว)
-                    for prog, count in progs_in_year.items():
+                    # 🔄 LOOP แยกแต่ละภาค
+                    for prog, count_val in progs_in_year.items():
                         
-                        # กำหนดเลข Sec เริ่มต้นให้ดูต่างกัน
-                        # Regular เริ่มที่ Sec 1
-                        # Special เริ่มที่ Sec 80 (จะได้ดูรู้เลยว่านี่ของภาคเป)
+                        # 🛡️ SAFETY GUARD 1: ถ้าคนเป็น 0 ให้ใช้ค่า Default
+                        count = count_val
+                        if count <= 0:
+                            count = Config.DEFAULT_REGULAR if prog == 'Regular' else Config.DEFAULT_SPECIAL
+                        
                         start_sec = 1 if prog == 'Regular' else 80 
                         
                         def create_course_variants(c_type, hours):
@@ -349,17 +342,21 @@ if st.button("🚀 Start Scheduling", type="primary"):
                             effective_limit = int(limit * 1.1) if opt_squeeze else limit
                             
                             num_secs = math.ceil(count / effective_limit)
+                            
+                            # 🛡️ SAFETY GUARD 2: ถ้าหารแล้วได้ 0 ให้เป็น 1 เสมอ
+                            if num_secs < 1: num_secs = 1
+                            
                             count_per_sec = math.ceil(count / num_secs)
                             
                             for i in range(num_secs):
                                 d = row.to_dict()
                                 d.update({
                                     'For_Major': maj,
-                                    'program': prog, # ใส่โปรแกรมเดียวเพียวๆ
+                                    'program': prog,
                                     'student_count': count_per_sec,
                                     'type': c_type,
                                     'duration': hours,
-                                    'section_idx': start_sec + i # รันเลข Sec
+                                    'section_idx': start_sec + i
                                 })
                                 all_courses.append(Course(d))
 
@@ -397,6 +394,6 @@ if st.button("🚀 Start Scheduling", type="primary"):
                         for c in scheduler.failed_courses:
                             st.write(f"- {c} -> {c.students} คน (ห้องเต็ม/ชน)")
             else:
-                st.error("❌ Solver Timeout: ข้อมูลเยอะเกินไป หรือเงื่อนไขแน่นเกินไป ลองกดใหม่อีกครั้ง")
+                st.error("❌ Solver Timeout: ลองลดเงื่อนไขดูครับ")
     else:
-        st.info("กรุณาอัปโหลดไฟล์ Rooms และ Subjects")
+        st.info("กรุณาอัปโหลดไฟล์ให้ครบ")
