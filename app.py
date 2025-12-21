@@ -2,7 +2,7 @@ import streamlit as st
 # ------------------------------------------------------------------
 # ⚡️ PART 0: SYSTEM CONFIG
 # ------------------------------------------------------------------
-st.set_page_config(page_title="KKU Scheduler (Survival Mode)", layout="wide")
+st.set_page_config(page_title="KKU Scheduler", layout="wide")
 
 import pandas as pd
 import io
@@ -15,13 +15,15 @@ from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
 # ⚙️ PART 1: CONSTANTS & CONFIG
 # ==========================================
 class Config:
-    # ค่า Default (จะถูก Override ตามที่ user ติ๊กเลือก)
     DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']
     TIME_SLOTS = range(8, 20)
     LUNCH_BREAK_HOUR = 12
     
     MAX_CAPACITY_LAB = 45     
     MAX_CAPACITY_LEC = 100    
+    
+    # ถ้าไม่มีข้อมูลนักเรียน ให้ใช้ค่า Default นี้
+    DEFAULT_STUDENTS = 40 
 
     COLOR_MAP = {
         'SC': 'FFF59D', 'CP': 'B3E5FC', 'LI': 'C8E6C9', 
@@ -37,7 +39,7 @@ class Course:
         self.name = str(data.get('course_name', 'Unknown')).strip()
         self.major = data.get('For_Major', 'Gen')
         self.year = int(data.get('year', 1))
-        self.program = data.get('program', 'Regular')
+        self.program = data.get('program', 'Regular') # Regular / Special
         
         self.type = data.get('type', 'Lec')
         self.duration = int(data.get('duration', 3))
@@ -45,10 +47,11 @@ class Course:
         self.students = int(data.get('student_count', 40))
         self.section_idx = int(data.get('section_idx', 1))
         
+        # Unique ID: แยก Major, Year, Program, Code, Sec
         self.uid = f"{self.major}_{self.year}_{self.program}_{self.code}_{self.type}_S{self.section_idx}_{id(self)}"
 
     def __repr__(self):
-        return f"{self.code} Sec.{self.section_idx} ({self.students} คน)"
+        return f"{self.code} ({self.program}) Sec.{self.section_idx}"
 
 # ==========================================
 # 🧠 PART 3: SOLVER ENGINE
@@ -58,7 +61,7 @@ class UniversityScheduler:
         self.courses = courses
         self.rooms = sorted(rooms, key=lambda x: x['capacity'])
         self.fixed_data = fixed_data
-        self.options = options # รับค่า Setting จากหน้าเว็บ
+        self.options = options 
         self.assignments = {}
         self.failed_courses = []
         
@@ -67,20 +70,18 @@ class UniversityScheduler:
         shifts = {} 
         scheduled_vars = [] 
         
-        # ปรับ Config ตาม Options
         active_days = Config.DAYS + (['Sat'] if self.options['allow_saturday'] else [])
         allow_lunch = self.options['allow_lunch']
-        capacity_flex = 0.9 if self.options['allow_squeeze'] else 1.0 # 0.9 แปลว่า ห้องจุได้ 90% ของ นศ. ก็ยอมให้ลง (เบียดได้)
+        capacity_flex = 0.9 if self.options['allow_squeeze'] else 1.0 
 
-        st.write(f"⚙️ กำลังประมวลผล {len(self.courses)} วิชา...")
-        st.caption(f"🔧 โหมด: วันเสาร์={self.options['allow_saturday']}, พักเที่ยง={allow_lunch}, นั่งเบียด={self.options['allow_squeeze']}")
+        st.write(f"⚙️ กำลังประมวลผล {len(self.courses)} รายการวิชา (รวมทุกภาค/ทุก Sec)...")
 
         # --- A. Variables ---
         for c in self.courses:
             valid_rooms = []
             
             for r in self.rooms:
-                # Logic: ความจุห้อง >= นักเรียน * ตัวคูณ (ถ้าเบียดได้ ตัวคูณคือ 0.9)
+                # Logic ความจุห้อง (ยืดหยุ่นได้ถ้าติ๊ก allow_squeeze)
                 if r['capacity'] >= (c.students * capacity_flex):
                     if c.type.lower() == 'lab':
                         if 'lab' in r['type'].lower(): valid_rooms.append(r)
@@ -91,7 +92,7 @@ class UniversityScheduler:
                 self.failed_courses.append(c)
                 continue
             
-            # Optimization: เลือก 10 ห้องที่ดีที่สุด (เพิ่มจาก 5 เป็น 10 เพื่อเพิ่มโอกาสหาเจอ)
+            # Optimization: เลือกห้องที่ดีที่สุด 10 ห้องแรก
             valid_rooms = valid_rooms[:10]
 
             c_moves = []
@@ -99,7 +100,6 @@ class UniversityScheduler:
                 for h in Config.TIME_SLOTS:
                     if h + c.duration > 20: continue
                     
-                    # เช็คพักเที่ยง (ถ้า user ไม่ติ๊ก allow_lunch ต้องห้ามลง)
                     if not allow_lunch:
                         if Config.LUNCH_BREAK_HOUR in range(h, h + c.duration): continue
                     
@@ -120,7 +120,7 @@ class UniversityScheduler:
                 model.Add(sum(c_moves) == is_scheduled)
                 scheduled_vars.append(is_scheduled)
             else:
-                 self.failed_courses.append(c) # ไม่มี Time slot ลงได้เลย
+                 self.failed_courses.append(c)
 
         # --- B. Constraints ---
         time_map = {}
@@ -136,6 +136,7 @@ class UniversityScheduler:
             for i in range(c.duration):
                 key = (d, h + i)
                 if key not in time_map: time_map[key] = []
+                # Group Key: Major + Year + Program (ภาคปกไม่ชนปก, พิเศษไม่ชนพิเศษ)
                 grp_key = f"{c.major}_{c.year}_{c.program}"
                 time_map[key].append({
                     'type': 'var', 'var': var, 'room': r_name, 
@@ -144,7 +145,7 @@ class UniversityScheduler:
 
         # Check Conflicts
         for slot, items in time_map.items():
-            # Room Usage
+            # Room Conflict
             room_usage = {}
             for item in items:
                 r = item['room']
@@ -159,7 +160,7 @@ class UniversityScheduler:
                 elif len(vars) > 1:
                     model.Add(sum(vars) <= 1)
 
-            # Instructor & Student Group Usage
+            # Instructor Conflict (อาจารย์คนเดียว สอนพร้อมกันไม่ได้ แม้คนละภาค)
             instr_usage = {}
             grp_usage = {}
             for item in items:
@@ -176,6 +177,7 @@ class UniversityScheduler:
             
             for _, vars in instr_usage.items():
                 if len(vars) > 1: model.Add(sum(vars) <= 1)
+            # Student Group Conflict
             for _, vars in grp_usage.items():
                 if len(vars) > 1: model.Add(sum(vars) <= 1)
 
@@ -183,7 +185,7 @@ class UniversityScheduler:
         model.Maximize(sum(scheduled_vars))
         solver = cp_model.CpSolver()
         solver.parameters.num_search_workers = 1 
-        solver.parameters.max_time_in_seconds = 600.0 # ให้เวลา 10 นาที
+        solver.parameters.max_time_in_seconds = 600.0
         solver.parameters.log_search_progress = True
         
         status = solver.Solve(model)
@@ -194,13 +196,11 @@ class UniversityScheduler:
                     c = next(course for course in self.courses if course.uid == uid)
                     self.assignments[c] = (d, h, r_name)
             
-            # Double check failed
             assigned_uids = {c.uid for c in self.assignments.keys()}
             for c in self.courses:
                 if c.uid not in assigned_uids and c not in self.failed_courses:
                     self.failed_courses.append(c)
             
-            # ลบพวกซ้ำๆ ใน failed list
             self.failed_courses = list(set(self.failed_courses))
             return True
         else:
@@ -216,6 +216,8 @@ def generate_excel(assignments, active_days):
     
     sheet_data = {}
     for c, (d, t, r) in assignments.items():
+        # แยก Sheet ตาม Major + Year + Program
+        # ex: CS_Y1_Regular, CS_Y1_Special
         key = f"{c.major}_Y{c.year}_{c.program}"
         if key not in sheet_data: sheet_data[key] = []
         sheet_data[key].append((c, d, t, r))
@@ -268,7 +270,7 @@ def generate_excel(assignments, active_days):
 # ==========================================
 # 🖥️ PART 5: USER INTERFACE
 # ==========================================
-st.title("🎓 KKU Scheduler (Single Semester)")
+st.title("🎓 KKU Scheduler (Fixed Missing Courses)")
 
 with st.sidebar:
     st.header("1. Upload Files")
@@ -278,15 +280,14 @@ with st.sidebar:
     f_fixed = st.file_uploader("Fixed Data (Optional)", type=['csv'], accept_multiple_files=True)
     
     st.markdown("---")
-    st.header("2. Survival Options (ตัวช่วย)")
-    st.caption("ถ้าจัดไม่ลง ลองติ๊กเลือกหัวข้อเหล่านี้:")
-    opt_saturday = st.checkbox("📅 เปิดสอนวันเสาร์ (Allow Saturday)", value=False)
-    opt_lunch = st.checkbox("🍱 เรียนพักเที่ยงได้ (Allow Lunch Class)", value=False)
-    opt_squeeze = st.checkbox("🪑 นั่งเบียดได้ 10% (Flexible Capacity)", value=True, help="เช่น ห้องจุ 40 แต่มี นศ. 44 คน ให้ยอมอนุโลมได้")
+    st.header("2. Survival Options")
+    opt_saturday = st.checkbox("📅 เปิดสอนวันเสาร์", value=False)
+    opt_lunch = st.checkbox("🍱 เรียนพักเที่ยงได้", value=False)
+    opt_squeeze = st.checkbox("🪑 นั่งเบียดได้ 10%", value=True)
 
 if st.button("🚀 Start Scheduling", type="primary"):
-    if f_rooms and f_students and f_subjects:
-        with st.spinner("⏳ Reading Data & Calculating..."):
+    if f_rooms and f_subjects: # Students file is now optional-ish (but recommended)
+        with st.spinner("⏳ Processing..."):
             
             # 1. Rooms
             df_rooms = pd.read_csv(f_rooms)
@@ -298,19 +299,21 @@ if st.button("🚀 Start Scheduling", type="primary"):
                     'type': str(r['type']).lower()
                 })
             
-            # 2. Students
-            df_std = pd.read_csv(f_students)
+            # 2. Students (สร้าง Map เพื่อดูว่าสาขานี้มีภาคอะไรบ้าง)
             std_map = {} 
             prog_map = {} 
-            for _, r in df_std.iterrows():
-                try:
-                    maj, yr, prog = r['major'], int(r['year']), r['program']
-                    std_map[(maj, yr, prog)] = int(r['student_count'])
-                    if (maj, yr) not in prog_map: prog_map[(maj, yr)] = []
-                    if prog not in prog_map[(maj, yr)]: prog_map[(maj, yr)].append(prog)
-                except: pass
-
-            # 3. Subjects & AUTO-SPLIT
+            if f_students:
+                df_std = pd.read_csv(f_students)
+                for _, r in df_std.iterrows():
+                    try:
+                        maj, yr, prog = r['major'], int(r['year']), r['program']
+                        std_map[(maj, yr, prog)] = int(r['student_count'])
+                        
+                        if (maj, yr) not in prog_map: prog_map[(maj, yr)] = []
+                        if prog not in prog_map[(maj, yr)]: prog_map[(maj, yr)].append(prog)
+                    except: pass
+            
+            # 3. Subjects (หัวใจสำคัญ: บังคับสร้างวิชาแม้ไม่มีข้อมูลนักเรียน)
             all_courses = []
             for f in f_subjects:
                 df = pd.read_csv(f)
@@ -318,17 +321,19 @@ if st.button("🚀 Start Scheduling", type="primary"):
                 
                 for _, row in df.iterrows():
                     yr = int(row['year'])
-                    # Default available programs if not found in student file
+                    
+                    # 🔎 เช็ค: ปีนี้มีภาคอะไรบ้าง? (Regular/Special)
+                    # ถ้าหาไม่เจอในไฟล์นักเรียน -> ให้ Default เป็น ['Regular'] ไว้ก่อน (กันวิชาหาย)
                     available_progs = prog_map.get((maj, yr), ['Regular'])
                     
+                    # ลูปสร้างวิชาให้ครบทุกภาค (Reg/Sp)
                     for prog in available_progs:
-                        total_students = std_map.get((maj, yr, prog), 40)
+                        # ถ้าไม่ทราบจำนวนคน -> ใช้ Default (40)
+                        total_students = std_map.get((maj, yr, prog), Config.DEFAULT_STUDENTS)
                         
                         def create_course_variants(c_type, hours):
                             if hours <= 0: return
                             limit = Config.MAX_CAPACITY_LAB if c_type == 'Lab' else Config.MAX_CAPACITY_LEC
-                            
-                            # ถ้าเปิดโหมดนั่งเบียด ให้หาร Sec ด้วย limit ที่เยอะขึ้นนิดนึง
                             effective_limit = int(limit * 1.1) if opt_squeeze else limit
                             
                             num_secs = 1
@@ -377,22 +382,19 @@ if st.button("🚀 Start Scheduling", type="primary"):
                 failed_c = len(scheduler.failed_courses)
                 
                 if failed_c == 0:
-                    st.success(f"🎉 สุดยอด! จัดตารางได้ครบ 100% ({success_c} วิชา)")
+                    st.success(f"🎉 จัดตารางเสร็จสมบูรณ์! ({success_c} รายการ)")
                 else:
-                    st.warning(f"⚠️ จัดได้ {success_c}/{total_c} วิชา (หลุดไป {failed_c} วิชา)")
+                    st.warning(f"⚠️ จัดได้ {success_c}/{total_c} รายการ (หาลงไม่ได้ {failed_c} รายการ)")
                 
-                # Excel
                 active_days = Config.DAYS + (['Sat'] if opt_saturday else [])
                 excel_file = generate_excel(scheduler.assignments, active_days)
                 st.download_button("📥 ดาวน์โหลดตารางเรียน (Excel)", excel_file, "Schedule.xlsx")
                 
-                # Show Failed Details
                 if scheduler.failed_courses:
-                    with st.expander(f"❌ ดูรายชื่อ {failed_c} วิชาที่หาลงไม่ได้"):
-                        st.write("ลองติ๊ก 'เปิดสอนวันเสาร์' หรือ 'เรียนพักเที่ยง' ดูนะครับ")
+                    with st.expander(f"❌ รายชื่อวิชาที่หลุด ({failed_c})"):
                         for c in scheduler.failed_courses:
-                            st.write(f"- {c} (ต้องการ {c.students} ที่นั่ง) -> ห้องอาจเต็มหรือเวลาชนกัน")
+                            st.write(f"- {c} (Major: {c.major}, Year: {c.year}) -> ต้องการ {c.students} ที่นั่ง")
             else:
                 st.error("❌ Solver Timeout: ลองลดจำนวนวิชา หรือเพิ่มตัวช่วยใน Sidebar")
     else:
-        st.info("กรุณาอัปโหลดไฟล์ให้ครบ")
+        st.info("กรุณาอัปโหลดไฟล์ Rooms และ Subjects เป็นอย่างน้อย")
